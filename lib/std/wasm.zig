@@ -585,6 +585,7 @@ pub const Limits = struct {
     pub const Flags = packed struct(u8) {
         has_max: bool,
         is_shared: bool,
+        reserved: u6 = 0,
     };
 };
 
@@ -596,13 +597,6 @@ pub const InitExpression = union(enum) {
     f32_const: f32,
     f64_const: f64,
     global_get: u32,
-};
-
-/// Tables are used to hold pointers to opaque objects.
-/// This can either by any function, or an object from the host.
-pub const Table = struct {
-    limits: Limits,
-    reftype: RefType,
 };
 
 /// Describes the layout of the memory where `min` represents

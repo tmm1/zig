@@ -12,18 +12,24 @@ pub const Index = enum(u32) {
 
 pub const Pointee = union {
     function: Wasm.FunctionIndex,
+    function_obj: Wasm.ObjectFunctionIndex,
+    function_zo: Wasm.ObjectFunctionIndex,
     function_import: Wasm.FunctionImportIndex,
     function_import_obj: Wasm.ObjectFunctionImportIndex,
     function_import_zo: ZigObject.FunctionImportIndex,
     /// This will be set to `undefined` when the symbol is undefined.
     data: void,
     global: Wasm.GlobalIndex,
+    global_obj: Wasm.ObjectGlobalIndex,
+    global_zo: Wasm.ObjectGlobalIndex,
     global_import: Wasm.GlobalImportIndex,
     global_import_obj: Wasm.ObjectGlobalImportIndex,
     global_import_zo: ZigObject.GlobalImportIndex,
     section: Wasm.SectionIndex,
+    section_zo: void,
     event: void,
     table: Wasm.TableIndex,
+    table_obj: Wasm.ObjectTableIndex,
     table_import: Wasm.TableImportIndex,
     table_import_obj: Wasm.ObjectTableImportIndex,
     dead: void,
@@ -59,39 +65,39 @@ pub const Tag = enum(u3) {
 };
 
 pub const Flags = packed struct(u32) {
-    binding: Binding,
+    binding: Binding = .strong,
     /// Indicating that this is a hidden symbol. Hidden symbols are not to be
     /// exported when performing the final link, but may be linked to other
     /// modules.
-    visibility_hidden: bool,
+    visibility_hidden: bool = false,
     padding0: u1 = 0,
     /// Indicating that this symbol is not defined. For non-data symbols, this
     /// must match whether the symbol is an import or is defined; for data
     /// symbols, determines whether a segment is specified.
-    undefined: bool,
+    undefined: bool = false,
     /// The symbol is intended to be exported from the wasm module to the host
     /// environment. This differs from the visibility flags in that it effects
     /// the static linker.
-    exported: bool,
+    exported: bool = false,
     /// The symbol uses an explicit symbol name, rather than reusing the name
     /// from a wasm import. This allows it to remap imports from foreign
     /// WebAssembly modules into local symbols with different names.
-    explicit_name: bool,
+    explicit_name: bool = false,
     /// The symbol is intended to be included in the linker output, regardless
     /// of whether it is used by the program.
-    no_strip: bool,
+    no_strip: bool = false,
     /// The symbol resides in thread local storage.
-    tls: bool,
+    tls: bool = false,
     /// The symbol represents an absolute address. This means its offset is
     /// relative to the start of the wasm memory as opposed to being relative
     /// to a data segment.
-    absolute: bool,
+    absolute: bool = false,
 
     padding1: u18 = 0,
     /// Zig-specific. Tag stored here for memory efficiency.
     tag: Tag,
     /// Zig-specific. Dead symbols are allowed to be garbage collected.
-    alive: bool,
+    alive: bool = false,
 
     pub const Binding = enum(u2) {
         strong = 0,

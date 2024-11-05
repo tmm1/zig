@@ -1,7 +1,6 @@
 const Object = @This();
 
 const Wasm = @import("../Wasm.zig");
-const Atom = Wasm.Atom;
 const Alignment = Wasm.Alignment;
 const Symbol = @import("Symbol.zig");
 
@@ -23,7 +22,7 @@ archive_member_name: ?[]const u8,
 /// Represents the function ID that must be called on startup.
 /// This is `null` by default as runtimes may determine the startup
 /// function themselves. This is essentially legacy.
-start_function: Wasm.OptionalFunctionIndex,
+start_function: Wasm.OptionalObjectFunctionIndex,
 /// A slice of features that tell the linker what features are mandatory, used
 /// (or therefore missing) and must generate an error when another object uses
 /// features that are not supported by the other.
@@ -95,7 +94,7 @@ fn parse(
 
     func_types.clearRetainingCapacity();
 
-    var start_function: Wasm.OptionalFunctionIndex = .none;
+    var start_function: Wasm.OptionalObjectFunctionIndex = .none;
     var features: ?Wasm.Feature.Set = null;
     var saw_linking_section = false;
     var saw_type_section = false;
@@ -227,16 +226,16 @@ fn parse(
                                         .function => {
                                             const local_index, pos = readLeb(u32, bytes, pos);
                                             if (symbol.flags.undefined) {
-                                                const function_import: Wasm.FunctionImportIndex = @enumFromInt(function_imports_start + local_index);
-                                                symbol.pointee = .{ .function_import = function_import };
+                                                const function_import: Wasm.ObjectFunctionImportIndex = @enumFromInt(function_imports_start + local_index);
+                                                symbol.pointee = .{ .function_import_obj = function_import };
                                                 if (flags.explicit_name) {
                                                     const name, pos = readBytes(bytes, pos);
                                                     symbol.name = try wasm.internString(name);
                                                 } else {
-                                                    symbol.name = wasm.objectFunctionImportPtr(symbol.pointee.function_import).name;
+                                                    symbol.name = wasm.objectFunctionImportPtr(function_import).name;
                                                 }
                                             } else {
-                                                symbol.pointee = .{ .function = @enumFromInt(functions_start + local_index) };
+                                                symbol.pointee = .{ .function_obj = @enumFromInt(functions_start + local_index) };
                                                 const name, pos = readBytes(bytes, pos);
                                                 symbol.name = try wasm.internString(name);
                                             }
@@ -244,16 +243,16 @@ fn parse(
                                         .global => {
                                             const local_index, pos = readLeb(u32, bytes, pos);
                                             if (symbol.flags.undefined) {
-                                                const global_import: Wasm.GlobalImportIndex = @enumFromInt(global_imports_start + local_index);
-                                                symbol.pointee = .{ .global_import = global_import };
+                                                const global_import: Wasm.ObjectGlobalImportIndex = @enumFromInt(global_imports_start + local_index);
+                                                symbol.pointee = .{ .global_import_obj = global_import };
                                                 if (flags.explicit_name) {
                                                     const name, pos = readBytes(bytes, pos);
                                                     symbol.name = try wasm.internString(name);
                                                 } else {
-                                                    symbol.name = wasm.objectGlobalImportPtr(symbol.pointee.global_import).name;
+                                                    symbol.name = wasm.objectGlobalImportPtr(global_import).name;
                                                 }
                                             } else {
-                                                symbol.pointee = .{ .global = @enumFromInt(globals_start + local_index) };
+                                                symbol.pointee = .{ .global_obj = @enumFromInt(globals_start + local_index) };
                                                 const name, pos = readBytes(bytes, pos);
                                                 symbol.name = try wasm.internString(name);
                                             }
@@ -262,16 +261,16 @@ fn parse(
                                             table_count += 1;
                                             const local_index, pos = readLeb(u32, bytes, pos);
                                             if (symbol.flags.undefined) {
-                                                const table_import: Wasm.TableImportIndex = @enumFromInt(table_imports_start + local_index);
-                                                symbol.pointee = .{ .table_import = table_import };
+                                                const table_import: Wasm.ObjectTableImportIndex = @enumFromInt(table_imports_start + local_index);
+                                                symbol.pointee = .{ .table_import_obj = table_import };
                                                 if (flags.explicit_name) {
                                                     const name, pos = readBytes(bytes, pos);
                                                     symbol.name = try wasm.internString(name);
                                                 } else {
-                                                    symbol.name = wasm.objectTableImportPtr(symbol.pointee.table_import).name;
+                                                    symbol.name = wasm.objectTableImportPtr(table_import).name;
                                                 }
                                             } else {
-                                                symbol.pointee = .{ .table = @enumFromInt(tables_start + local_index) };
+                                                symbol.pointee = .{ .table_obj = @enumFromInt(tables_start + local_index) };
                                                 const name, pos = readBytes(bytes, pos);
                                                 symbol.name = try wasm.internString(name);
                                             }

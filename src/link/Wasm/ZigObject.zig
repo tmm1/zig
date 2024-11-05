@@ -7,15 +7,14 @@ path: Path,
 /// Map of all `Nav` that are currently alive.
 /// Each index maps to the corresponding `NavInfo`.
 navs: std.AutoHashMapUnmanaged(InternPool.Nav.Index, NavInfo) = .empty,
-/// List of `std.wasm.Func`. Each entry contains the function signature,
-/// rather than the actual body.
-functions: std.ArrayListUnmanaged(std.wasm.Func) = .empty,
+/// Each entry contains the function signature rather than the actual body.
+functions: std.ArrayListUnmanaged(Wasm.FunctionType.Index) = .empty,
 /// List of indexes pointing to an entry within the `functions` list which has been removed.
 functions_free_list: std.ArrayListUnmanaged(u32) = .empty,
 function_imports: std.ArrayListUnmanaged(Wasm.FunctionImport) = .empty,
 global_imports: std.ArrayListUnmanaged(Wasm.GlobalImport) = .empty,
 /// List of WebAssembly globals.
-globals: std.ArrayListUnmanaged(std.wasm.Global) = .empty,
+globals: std.ArrayListUnmanaged(Wasm.Global) = .empty,
 /// Mapping between an `Atom` and its type index representing the Wasm
 /// type of the function signature.
 atom_types: std.AutoHashMapUnmanaged(Atom.Index, u32) = .empty,
@@ -38,9 +37,9 @@ synthetic_functions: std.ArrayListUnmanaged(Atom.Index) = .empty,
 /// During initializion, a symbol with corresponding atom will be created that is
 /// used to perform relocations to the pointer of this table.
 /// The actual table is populated during `flush`.
-error_table_symbol: Symbol.Index = .null,
+error_table_symbol: ?Symbol.Index = null,
 /// Atom index of the table of symbol names. This is stored so we can clean up the atom.
-error_names_atom: Atom.Index = .null,
+error_names_atom: Atom.OptionalIndex = .none,
 /// Symbol index representing the stack pointer. This will be set upon initializion
 /// of a new `ZigObject`. Codegen will make calls into this to create relocations for
 /// this symbol each time the stack pointer is moved.
@@ -87,7 +86,7 @@ pub const GlobalImportIndex = enum(u32) {
 };
 
 const NavInfo = struct {
-    atom: Atom.Index = .null,
+    atom: Atom.Index = .none,
     exports: std.ArrayListUnmanaged(Symbol.Index) = .empty,
 
     fn @"export"(ni: NavInfo, zo: *const ZigObject, name: Wasm.String) ?Symbol.Index {
@@ -177,19 +176,17 @@ pub fn deinit(zig_object: *ZigObject, wasm: *Wasm) void {
         const atom_index = wasm.symbol_atom.get(.{ .file = .zig_object, .index = sym_index }).?;
         wasm.getAtomPtr(atom_index).deinit(gpa);
     }
-    if (wasm.symbol_atom.get(.{ .file = .zig_object, .index = zig_object.error_table_symbol })) |atom_index| {
-        const atom = wasm.getAtomPtr(atom_index);
-        atom.deinit(gpa);
+    if (zig_object.error_table_symbol) |error_table_symbol| {
+        if (wasm.symbol_atom.get(.{ .file = .zig_object, .index = error_table_symbol })) |atom_index| {
+            const atom = wasm.getAtomPtr(atom_index);
+            atom.deinit(gpa);
+        }
     }
     for (zig_object.synthetic_functions.items) |atom_index| {
         const atom = wasm.getAtomPtr(atom_index);
         atom.deinit(gpa);
     }
     zig_object.synthetic_functions.deinit(gpa);
-    if (zig_object.error_names_atom != .null) {
-        const atom = wasm.getAtomPtr(zig_object.error_names_atom);
-        atom.deinit(gpa);
-    }
     zig_object.global_syms.deinit(gpa);
     zig_object.atom_types.deinit(gpa);
     zig_object.functions.deinit(gpa);
@@ -498,8 +495,10 @@ fn lowerConst(
         errdefer gpa.free(segment_name);
         zig_object.symbol(sym_index).* = .{
             .name = try wasm.internString(name),
-            .flags = @intFromEnum(Symbol.Flag.WASM_SYM_BINDING_LOCAL),
-            .tag = .data,
+            .flags = .{
+                .tag = .data,
+                .binding = .local,
+            },
             .index = try zig_object.createDataSegment(
                 gpa,
                 segment_name,
@@ -534,7 +533,7 @@ fn lowerConst(
 ///
 /// When the symbol does not yet exist, it will create a new one instead.
 pub fn getErrorTableSymbol(zig_object: *ZigObject, wasm: *Wasm, pt: Zcu.PerThread) !Symbol.Index {
-    if (zig_object.error_table_symbol != .null) {
+    if (zig_object.error_table_symbol != null) {
         return zig_object.error_table_symbol;
     }
 
@@ -552,8 +551,10 @@ pub fn getErrorTableSymbol(zig_object: *ZigObject, wasm: *Wasm, pt: Zcu.PerThrea
     const sym = zig_object.symbol(sym_index);
     sym.* = .{
         .name = wasm.preloaded_strings.__zig_err_name_table,
-        .tag = .data,
-        .flags = @intFromEnum(Symbol.Flag.WASM_SYM_BINDING_LOCAL),
+        .flags = .{
+            .tag = .data,
+            .binding = .local,
+        },
         .index = try zig_object.createDataSegment(gpa, segment_name, atom.alignment),
         .virtual_address = undefined,
     };
@@ -568,7 +569,7 @@ pub fn getErrorTableSymbol(zig_object: *ZigObject, wasm: *Wasm, pt: Zcu.PerThrea
 /// This creates a table that consists of pointers and length to each error name.
 /// The table is what is being pointed to within the runtime bodies that are generated.
 fn populateErrorNameTable(zig_object: *ZigObject, wasm: *Wasm, tid: Zcu.PerThread.Id) !void {
-    if (zig_object.error_table_symbol == .null) return;
+    if (zig_object.error_table_symbol == null) return;
     const gpa = wasm.base.comp.gpa;
     const atom_index = wasm.symbol_atom.get(.{ .file = .zig_object, .index = zig_object.error_table_symbol }).?;
 
@@ -583,8 +584,10 @@ fn populateErrorNameTable(zig_object: *ZigObject, wasm: *Wasm, tid: Zcu.PerThrea
     const names_symbol = zig_object.symbol(names_sym_index);
     names_symbol.* = .{
         .name = wasm.preloaded_strings.__zig_err_names,
-        .tag = .data,
-        .flags = @intFromEnum(Symbol.Flag.WASM_SYM_BINDING_LOCAL),
+        .flags = .{
+            .tag = .data,
+            .binding = .local,
+        },
         .index = try zig_object.createDataSegment(gpa, segment_name, names_atom.alignment),
         .virtual_address = undefined,
     };
@@ -631,7 +634,7 @@ fn populateErrorNameTable(zig_object: *ZigObject, wasm: *Wasm, tid: Zcu.PerThrea
         log.debug("Populated error name: '{}'", .{error_name.fmt(ip)});
     }
     names_atom.size = addend;
-    zig_object.error_names_atom = names_atom_index;
+    zig_object.error_names_atom = names_atom_index.toOptional();
 }
 
 /// Either creates a new import, or updates one if existing.
@@ -652,7 +655,6 @@ pub fn addOrUpdateImport(
     func_type_index: ?Wasm.FunctionType.Index,
 ) !void {
     const gpa = wasm.base.comp.gpa;
-    assert(symbol_index != .null);
     // For the import name, we use the decl's name, rather than the fully qualified name
     // Also mangle the name when the lib name is set and not equal to "C" so imports with the same
     // name but different module can be resolved correctly.
@@ -707,8 +709,8 @@ pub fn getGlobalSymbol(zig_object: *ZigObject, gpa: std.mem.Allocator, name_inde
         .tag = .function,
         .virtual_address = std.math.maxInt(u32),
     };
-    sym.setGlobal(true);
-    sym.setUndefined(true);
+    sym.flags.binding = .strong;
+    sym.flags.undefined = true;
 
     const sym_index = if (zig_object.symbols_free_list.popOrNull()) |index| index else blk: {
         const index: Symbol.Index = @enumFromInt(zig_object.symbols.items.len);
@@ -889,20 +891,15 @@ pub fn updateExports(
         };
 
         const sym = zig_object.symbol(sym_index);
-        sym.setGlobal(true);
-        sym.setUndefined(false);
-        sym.index = atom_sym.index;
-        sym.tag = atom_sym.tag;
+        sym.flags.undefined = false;
+        sym.flags.tag = atom_sym.tag;
+        sym.pointee = atom_sym.pointee;
         sym.name = export_name;
 
         switch (exp.opts.linkage) {
-            .internal => {
-                sym.setFlag(.WASM_SYM_VISIBILITY_HIDDEN);
-            },
-            .weak => {
-                sym.setFlag(.WASM_SYM_BINDING_WEAK);
-            },
-            .strong => {}, // symbols are strong by default
+            .internal => sym.flags.binding = .local,
+            .weak => sym.flags.binding = .weak,
+            .strong => sym.flags.binding = .strong,
             .link_once => {
                 try zcu.failed_exports.putNoClobber(gpa, export_idx, try Zcu.ErrorMsg.create(
                     gpa,
@@ -913,9 +910,7 @@ pub fn updateExports(
                 continue;
             },
         }
-        if (exp.opts.visibility == .hidden) {
-            sym.setFlag(.WASM_SYM_VISIBILITY_HIDDEN);
-        }
+        sym.flags.visibility_hidden = exp.opts.visibility == .hidden;
         log.debug("  with name '{s}' - {}", .{ wasm.stringSlice(export_name), sym });
         try zig_object.global_syms.put(gpa, export_name, sym_index);
         try wasm.symbol_atom.put(gpa, .{ .file = .zig_object, .index = sym_index }, atom_index);
@@ -984,7 +979,7 @@ fn setupErrorsLen(zig_object: *ZigObject, wasm: *Wasm) !void {
     // if not, allocate a new atom.
     const atom_index = if (wasm.symbol_atom.get(.{ .file = .zig_object, .index = sym_index })) |index| blk: {
         const atom = wasm.getAtomPtr(index);
-        atom.prev = .null;
+        atom.prev = .none;
         atom.deinit(gpa);
         break :blk index;
     } else idx: {
@@ -992,8 +987,8 @@ fn setupErrorsLen(zig_object: *ZigObject, wasm: *Wasm) !void {
         // and define it, so the final binary or resulting object file will not attempt
         // to resolve it.
         const sym = zig_object.symbol(sym_index);
-        sym.setGlobal(false);
-        sym.setUndefined(false);
+        sym.flags.binding = .local;
+        sym.flags.undefined = false;
         sym.tag = .data;
         const segment_name = try gpa.dupe(u8, ".rodata.__zig_errors_len");
         sym.index = try zig_object.createDataSegment(gpa, segment_name, .@"2");
@@ -1039,10 +1034,12 @@ pub fn createDebugSectionForIndex(zig_object: *ZigObject, wasm: *Wasm, index: *?
     const atom_index = try wasm.createAtom(sym_index, .zig_object);
     const atom = wasm.getAtomPtr(atom_index);
     zig_object.symbols.items[sym_index] = .{
-        .tag = .section,
+        .flags = .{
+            .tag = .section,
+            .binding = .local,
+        },
         .name = try wasm.internString(name),
-        .index = 0,
-        .flags = @intFromEnum(Symbol.Flag.WASM_SYM_BINDING_LOCAL),
+        .pointee = .section_zo,
     };
 
     atom.alignment = .@"1"; // debug sections are always 1-byte-aligned
@@ -1169,8 +1166,7 @@ pub fn createFunction(
     return sym_index;
 }
 
-/// Appends a new `std.wasm.Func` to the list of functions and returns its index.
-fn appendFunction(zig_object: *ZigObject, gpa: std.mem.Allocator, func: std.wasm.Func) !u32 {
+fn appendFunction(zig_object: *ZigObject, gpa: std.mem.Allocator, func_type: Wasm.FunctionType.Index) !u32 {
     const index: u32 = if (zig_object.functions_free_list.popOrNull()) |idx|
         idx
     else idx: {
@@ -1178,7 +1174,7 @@ fn appendFunction(zig_object: *ZigObject, gpa: std.mem.Allocator, func: std.wasm
         _ = try zig_object.functions.addOne(gpa);
         break :idx len;
     };
-    zig_object.functions.items[index] = func;
+    zig_object.functions.items[index] = func_type;
 
     return index;
 }
