@@ -7328,7 +7328,7 @@ fn getTagNameFunction(func: *CodeGen, enum_ty: Type) InnerError!u32 {
             const encoded_alignment = @ctz(@as(u32, 4));
             try writer.writeByte(std.wasm.opcode(.i32_const));
             try relocs.append(.{
-                .relocation_type = .R_WASM_MEMORY_ADDR_LEB,
+                .tag = .R_WASM_MEMORY_ADDR_LEB,
                 .offset = @as(u32, @intCast(body_list.items.len)),
                 .index = tag_sym_index,
             });
@@ -7349,7 +7349,7 @@ fn getTagNameFunction(func: *CodeGen, enum_ty: Type) InnerError!u32 {
             const encoded_alignment = @ctz(@as(u32, 8));
             try writer.writeByte(std.wasm.opcode(.i64_const));
             try relocs.append(.{
-                .relocation_type = .R_WASM_MEMORY_ADDR_LEB64,
+                .tag = .R_WASM_MEMORY_ADDR_LEB64,
                 .offset = @as(u32, @intCast(body_list.items.len)),
                 .index = tag_sym_index,
             });

@@ -315,7 +315,7 @@ fn emitGlobal(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) !void {
     try atom.relocs.append(gpa, .{
         .index = label,
         .offset = global_offset,
-        .relocation_type = .R_WASM_GLOBAL_INDEX_LEB,
+        .tag = .GLOBAL_INDEX_LEB,
     });
 }
 
@@ -375,7 +375,7 @@ fn emitCall(emit: *Emit, inst: Mir.Inst.Index) !void {
         try atom.relocs.append(gpa, .{
             .offset = call_offset,
             .index = label,
-            .relocation_type = .R_WASM_FUNCTION_INDEX_LEB,
+            .tag = .FUNCTION_INDEX_LEB,
         });
     }
 }
@@ -395,7 +395,7 @@ fn emitCallIndirect(emit: *Emit, inst: Mir.Inst.Index) !void {
         try atom.relocs.append(emit.bin_file.base.comp.gpa, .{
             .offset = call_offset,
             .index = type_index,
-            .relocation_type = .R_WASM_TYPE_INDEX_LEB,
+            .tag = .TYPE_INDEX_LEB,
         });
     }
     try leb128.writeUleb128(emit.code.writer(), @as(u32, 0)); // TODO: Emit relocation for table index
@@ -417,7 +417,7 @@ fn emitFunctionIndex(emit: *Emit, inst: Mir.Inst.Index) !void {
         try atom.relocs.append(gpa, .{
             .offset = index_offset,
             .index = symbol_index,
-            .relocation_type = .R_WASM_TABLE_INDEX_SLEB,
+            .tag = .TABLE_INDEX_SLEB,
         });
     }
 }
@@ -448,7 +448,7 @@ fn emitMemAddress(emit: *Emit, inst: Mir.Inst.Index) !void {
         try atom.relocs.append(gpa, .{
             .offset = mem_offset,
             .index = mem.pointer,
-            .relocation_type = if (is_wasm32) .R_WASM_MEMORY_ADDR_LEB else .R_WASM_MEMORY_ADDR_LEB64,
+            .tag = if (is_wasm32) .MEMORY_ADDR_LEB else .MEMORY_ADDR_LEB64,
             .addend = @as(i32, @intCast(mem.offset)),
         });
     }

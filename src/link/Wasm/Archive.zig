@@ -158,7 +158,11 @@ pub fn parseObject(archive: Archive, wasm: *Wasm, file_contents: []const u8, pat
 
     const object_file_size = try header.parsedSize();
 
-    return Object.create(wasm, file_contents[@sizeOf(Header)..][0..object_file_size], path, object_name);
+    const gpa = wasm.base.comp.gpa;
+    var func_types: std.ArrayListUnmanaged(Wasm.FunctionType.Index) = .empty;
+    defer func_types.deinit(gpa);
+
+    return Object.parse(wasm, file_contents[@sizeOf(Header)..][0..object_file_size], path, object_name, &func_types);
 }
 
 const Archive = @This();

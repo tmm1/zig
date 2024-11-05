@@ -7,15 +7,13 @@ path: Path,
 /// Map of all `Nav` that are currently alive.
 /// Each index maps to the corresponding `NavInfo`.
 navs: std.AutoHashMapUnmanaged(InternPool.Nav.Index, NavInfo) = .empty,
-/// List of function type signatures for this Zig module.
-func_types: std.ArrayListUnmanaged(std.wasm.Type) = .empty,
 /// List of `std.wasm.Func`. Each entry contains the function signature,
 /// rather than the actual body.
 functions: std.ArrayListUnmanaged(std.wasm.Func) = .empty,
 /// List of indexes pointing to an entry within the `functions` list which has been removed.
 functions_free_list: std.ArrayListUnmanaged(u32) = .empty,
-/// Map of symbol locations, represented by its `Wasm.Import`.
-imports: std.AutoHashMapUnmanaged(Symbol.Index, Wasm.Import) = .empty,
+function_imports: std.ArrayListUnmanaged(Wasm.FunctionImport) = .empty,
+global_imports: std.ArrayListUnmanaged(Wasm.GlobalImport) = .empty,
 /// List of WebAssembly globals.
 globals: std.ArrayListUnmanaged(std.wasm.Global) = .empty,
 /// Mapping between an `Atom` and its type index representing the Wasm
@@ -43,10 +41,6 @@ synthetic_functions: std.ArrayListUnmanaged(Atom.Index) = .empty,
 error_table_symbol: Symbol.Index = .null,
 /// Atom index of the table of symbol names. This is stored so we can clean up the atom.
 error_names_atom: Atom.Index = .null,
-/// Amount of functions in the `import` sections.
-imported_functions_count: u32 = 0,
-/// Amount of globals in the `import` section.
-imported_globals_count: u32 = 0,
 /// Symbol index representing the stack pointer. This will be set upon initializion
 /// of a new `ZigObject`. Codegen will make calls into this to create relocations for
 /// this symbol each time the stack pointer is moved.
@@ -81,6 +75,16 @@ debug_pubtypes_index: ?u32 = null,
 debug_str_index: ?u32 = null,
 /// The index of the segment representing the custom '.debug_pubtypes' section.
 debug_abbrev_index: ?u32 = null,
+
+/// Index into function_imports
+pub const FunctionImportIndex = enum(u32) {
+    _,
+};
+
+/// Index into global_imports
+pub const GlobalImportIndex = enum(u32) {
+    _,
+};
 
 const NavInfo = struct {
     atom: Atom.Index = .null,
@@ -118,20 +122,21 @@ pub fn init(zig_object: *ZigObject, wasm: *Wasm) !void {
     // TODO: Initialize debug information when we reimplement Dwarf support.
 }
 
-fn createStackPointer(zig_object: *ZigObject, wasm: *Wasm) !void {
+fn createStackPointer(zo: *ZigObject, wasm: *Wasm) !void {
     const gpa = wasm.base.comp.gpa;
-    const sym_index = try zig_object.getGlobalSymbol(gpa, wasm.preloaded_strings.__stack_pointer);
-    const sym = zig_object.symbol(sym_index);
-    sym.index = zig_object.imported_globals_count;
-    sym.tag = .global;
-    const is_wasm32 = wasm.base.comp.root_mod.resolved_target.result.cpu.arch == .wasm32;
-    try zig_object.imports.putNoClobber(gpa, sym_index, .{
+    const target = wasm.base.comp.root_mod.resolved_target;
+    const is_wasm32 = target.result.cpu.arch == .wasm32;
+    const sym_index = try zo.getGlobalSymbol(gpa, wasm.preloaded_strings.__stack_pointer);
+    const sym = zo.symbol(sym_index);
+    sym.pointee = .{ .zo_global_import = @enumFromInt(zo.global_imports.items.len) };
+    sym.flags.tag = .global;
+    try zo.global_imports.append(gpa, .{
         .name = sym.name,
         .module_name = wasm.host_name,
-        .kind = .{ .global = .{ .valtype = if (is_wasm32) .i32 else .i64, .mutable = true } },
+        .mutable = true,
+        .valtype = if (is_wasm32) .i32 else .i64,
     });
-    zig_object.imported_globals_count += 1;
-    zig_object.stack_pointer_sym = sym_index;
+    zo.stack_pointer_sym = sym_index;
 }
 
 pub fn symbol(zig_object: *const ZigObject, index: Symbol.Index) *Symbol {
@@ -181,18 +186,15 @@ pub fn deinit(zig_object: *ZigObject, wasm: *Wasm) void {
         atom.deinit(gpa);
     }
     zig_object.synthetic_functions.deinit(gpa);
-    for (zig_object.func_types.items) |*ty| {
-        ty.deinit(gpa);
-    }
     if (zig_object.error_names_atom != .null) {
         const atom = wasm.getAtomPtr(zig_object.error_names_atom);
         atom.deinit(gpa);
     }
     zig_object.global_syms.deinit(gpa);
-    zig_object.func_types.deinit(gpa);
     zig_object.atom_types.deinit(gpa);
     zig_object.functions.deinit(gpa);
-    zig_object.imports.deinit(gpa);
+    zig_object.function_imports.deinit(gpa);
+    zig_object.global_imports.deinit(gpa);
     zig_object.navs.deinit(gpa);
     zig_object.uavs.deinit(gpa);
     zig_object.symbols.deinit(gpa);
@@ -209,21 +211,23 @@ pub fn deinit(zig_object: *ZigObject, wasm: *Wasm) void {
 
 /// Allocates a new symbol and returns its index.
 /// Will re-use slots when a symbol was freed at an earlier stage.
-pub fn allocateSymbol(zig_object: *ZigObject, gpa: std.mem.Allocator) !Symbol.Index {
-    try zig_object.symbols.ensureUnusedCapacity(gpa, 1);
-    const sym: Symbol = .{
+fn createSymbol(zo: *ZigObject, gpa: std.mem.Allocator) error{OutOfMemory}!Symbol.Index {
+    if (zo.symbols_free_list.popOrNull()) |index| return index;
+    try zo.symbols.addOne(gpa);
+    return @enumFromInt(zo.symbols.items.len - 1);
+}
+
+fn allocateSymbol(zo: *ZigObject, gpa: std.mem.Allocator) error{OutOfMemory}!Symbol.Index {
+    const index = try createSymbol(zo, gpa);
+    zo.symbol(index).* = .{
         .name = undefined, // will be set after updateDecl as well as during atom creation for decls
-        .flags = @intFromEnum(Symbol.Flag.WASM_SYM_BINDING_LOCAL),
-        .tag = .undefined, // will be set after updateDecl
-        .index = std.math.maxInt(u32), // will be set during atom parsing
-        .virtual_address = std.math.maxInt(u32), // will be set during atom allocation
+        .flags = .{
+            .binding = .local,
+            .tag = .uninitialized,
+        },
+        .index = undefined, // will be set during atom parsing
+        .virtual_address = undefined, // will be set during atom allocation
     };
-    if (zig_object.symbols_free_list.popOrNull()) |index| {
-        zig_object.symbols.items[@intFromEnum(index)] = sym;
-        return index;
-    }
-    const index: Symbol.Index = @enumFromInt(zig_object.symbols.items.len);
-    zig_object.symbols.appendAssumeCapacity(sym);
     return index;
 }
 
@@ -613,7 +617,7 @@ fn populateErrorNameTable(zig_object: *ZigObject, wasm: *Wasm, tid: Zcu.PerThrea
         // create relocation to the error name
         try atom.relocs.append(gpa, .{
             .index = @intFromEnum(names_atom.sym_index),
-            .relocation_type = .R_WASM_MEMORY_ADDR_I32,
+            .tag = .MEMORY_ADDR_I32,
             .offset = offset,
             .addend = @intCast(addend),
         });
@@ -634,7 +638,7 @@ fn populateErrorNameTable(zig_object: *ZigObject, wasm: *Wasm, tid: Zcu.PerThrea
 /// When `type_index` is non-null, we assume an external function.
 /// In all other cases, a data-symbol will be created instead.
 pub fn addOrUpdateImport(
-    zig_object: *ZigObject,
+    zo: *ZigObject,
     wasm: *Wasm,
     /// Name of the import
     name: []const u8,
@@ -645,10 +649,10 @@ pub fn addOrUpdateImport(
     /// The index of the type that represents the function signature
     /// when the extern is a function. When this is null, a data-symbol
     /// is asserted instead.
-    type_index: ?u32,
+    func_type_index: ?Wasm.FunctionType.Index,
 ) !void {
     const gpa = wasm.base.comp.gpa;
-    std.debug.assert(symbol_index != .null);
+    assert(symbol_index != .null);
     // For the import name, we use the decl's name, rather than the fully qualified name
     // Also mangle the name when the lib name is set and not equal to "C" so imports with the same
     // name but different module can be resolved correctly.
@@ -660,27 +664,29 @@ pub fn addOrUpdateImport(
     defer if (mangle_name) gpa.free(full_name);
 
     const decl_name_index = try wasm.internString(full_name);
-    const sym: *Symbol = &zig_object.symbols.items[@intFromEnum(symbol_index)];
-    sym.setUndefined(true);
-    sym.setGlobal(true);
+    const sym = zo.symbol(symbol_index);
+    sym.flags.binding = .strong;
+    sym.flags.undefined = true;
+    sym.flags.explicit_name = mangle_name; // Symbol name does not match the import name.
     sym.name = decl_name_index;
-    if (mangle_name) {
-        // we specified a specific name for the symbol that does not match the import name
-        sym.setFlag(.WASM_SYM_EXPLICIT_NAME);
-    }
 
-    if (type_index) |ty_index| {
-        const gop = try zig_object.imports.getOrPut(gpa, symbol_index);
+    if (func_type_index) |ty_index| {
+        const was_uninitialized = sym.flags.tag == .uninitialized;
+        sym.flags.tag = .function;
+
+        if (was_uninitialized) {
+            try zo.function_imports.addOne(gpa);
+            sym.pointee = .{ .function_import_zo = @enumFromInt(zo.function_imports.items.len - 1) };
+        }
         const module_name = if (lib_name) |n| try wasm.internString(n) else wasm.host_name;
-        if (!gop.found_existing) zig_object.imported_functions_count += 1;
-        gop.value_ptr.* = .{
+        zo.functionImportPtr(sym.pointee.function_import_zo).* = .{
             .module_name = module_name,
             .name = try wasm.internString(name),
-            .kind = .{ .function = ty_index },
+            .index = ty_index,
         };
-        sym.tag = .function;
     } else {
-        sym.tag = .data;
+        sym.flags.tag = .data;
+        sym.pointee = .data;
     }
 }
 
@@ -744,7 +750,7 @@ pub fn getNavVAddr(
         else => {},
     }
 
-    std.debug.assert(reloc_info.parent.atom_index != 0);
+    assert(reloc_info.parent.atom_index != 0);
     const atom_index = wasm.symbol_atom.get(.{
         .file = .zig_object,
         .index = @enumFromInt(reloc_info.parent.atom_index),
@@ -752,17 +758,17 @@ pub fn getNavVAddr(
     const atom = wasm.getAtomPtr(atom_index);
     const is_wasm32 = target.cpu.arch == .wasm32;
     if (ip.isFunctionType(ip.getNav(nav_index).typeOf(ip))) {
-        std.debug.assert(reloc_info.addend == 0); // addend not allowed for function relocations
+        assert(reloc_info.addend == 0); // addend not allowed for function relocations
         try atom.relocs.append(gpa, .{
             .index = target_symbol_index,
             .offset = @intCast(reloc_info.offset),
-            .relocation_type = if (is_wasm32) .R_WASM_TABLE_INDEX_I32 else .R_WASM_TABLE_INDEX_I64,
+            .tag = if (is_wasm32) .TABLE_INDEX_I32 else .TABLE_INDEX_I64,
         });
     } else {
         try atom.relocs.append(gpa, .{
             .index = target_symbol_index,
             .offset = @intCast(reloc_info.offset),
-            .relocation_type = if (is_wasm32) .R_WASM_MEMORY_ADDR_I32 else .R_WASM_MEMORY_ADDR_I64,
+            .tag = if (is_wasm32) .MEMORY_ADDR_I32 else .MEMORY_ADDR_I64,
             .addend = @intCast(reloc_info.addend),
         });
     }
@@ -794,17 +800,17 @@ pub fn getUavVAddr(
     const zcu = wasm.base.comp.zcu.?;
     const ty = Type.fromInterned(zcu.intern_pool.typeOf(uav));
     if (ty.zigTypeTag(zcu) == .@"fn") {
-        std.debug.assert(reloc_info.addend == 0); // addend not allowed for function relocations
+        assert(reloc_info.addend == 0); // addend not allowed for function relocations
         try parent_atom.relocs.append(gpa, .{
             .index = target_symbol_index,
             .offset = @intCast(reloc_info.offset),
-            .relocation_type = if (is_wasm32) .R_WASM_TABLE_INDEX_I32 else .R_WASM_TABLE_INDEX_I64,
+            .tag = if (is_wasm32) .TABLE_INDEX_I32 else .TABLE_INDEX_I64,
         });
     } else {
         try parent_atom.relocs.append(gpa, .{
             .index = target_symbol_index,
             .offset = @intCast(reloc_info.offset),
-            .relocation_type = if (is_wasm32) .R_WASM_MEMORY_ADDR_I32 else .R_WASM_MEMORY_ADDR_I64,
+            .tag = if (is_wasm32) .MEMORY_ADDR_I32 else .MEMORY_ADDR_I64,
             .addend = @intCast(reloc_info.addend),
         });
     }
@@ -832,8 +838,8 @@ pub fn deleteExport(
     if (nav_info.@"export"(zig_object, name_interned)) |sym_index| {
         const sym = zig_object.symbol(sym_index);
         nav_info.deleteExport(sym_index);
-        std.debug.assert(zig_object.global_syms.remove(sym.name));
-        std.debug.assert(wasm.symbol_atom.remove(.{ .file = .zig_object, .index = sym_index }));
+        assert(zig_object.global_syms.remove(sym.name));
+        assert(wasm.symbol_atom.remove(.{ .file = .zig_object, .index = sym_index }));
         zig_object.symbols_free_list.append(wasm.base.comp.gpa, sym_index) catch {};
         sym.tag = .dead;
     }
@@ -930,14 +936,14 @@ pub fn freeNav(zig_object: *ZigObject, wasm: *Wasm, nav_index: InternPool.Nav.In
         zig_object.symbols_free_list.append(exp_sym_index) catch {};
     }
     nav_info.exports.deinit(gpa);
-    std.debug.assert(zig_object.navs.remove(nav_index));
+    assert(zig_object.navs.remove(nav_index));
     const sym = &zig_object.symbols.items[atom.sym_index];
     for (atom.locals.items) |local_atom_index| {
         const local_atom = wasm.getAtom(local_atom_index);
         const local_symbol = &zig_object.symbols.items[local_atom.sym_index];
-        std.debug.assert(local_symbol.tag == .data);
+        assert(local_symbol.tag == .data);
         zig_object.symbols_free_list.append(gpa, local_atom.sym_index) catch {};
-        std.debug.assert(wasm.symbol_atom.remove(local_atom.symbolLoc()));
+        assert(wasm.symbol_atom.remove(local_atom.symbolLoc()));
         local_symbol.tag = .dead; // also for any local symbol
         const segment = &zig_object.segment_info.items[local_atom.sym_index];
         gpa.free(segment.name);
@@ -945,10 +951,7 @@ pub fn freeNav(zig_object: *ZigObject, wasm: *Wasm, nav_index: InternPool.Nav.In
     }
 
     const nav_val = zcu.navValue(nav_index).toIntern();
-    if (ip.indexToKey(nav_val) == .@"extern") {
-        std.debug.assert(zig_object.imports.remove(atom.sym_index));
-    }
-    std.debug.assert(wasm.symbol_atom.remove(atom.symbolLoc()));
+    assert(wasm.symbol_atom.remove(atom.symbolLoc()));
 
     // if (wasm.dwarf) |*dwarf| {
     //     dwarf.freeDecl(decl_index);
@@ -957,45 +960,17 @@ pub fn freeNav(zig_object: *ZigObject, wasm: *Wasm, nav_index: InternPool.Nav.In
     atom.prev = null;
     sym.tag = .dead;
     if (sym.isGlobal()) {
-        std.debug.assert(zig_object.global_syms.remove(atom.sym_index));
+        assert(zig_object.global_syms.remove(atom.sym_index));
     }
     if (ip.isFunctionType(ip.typeOf(nav_val))) {
         zig_object.functions_free_list.append(gpa, sym.index) catch {};
-        std.debug.assert(zig_object.atom_types.remove(atom_index));
+        assert(zig_object.atom_types.remove(atom_index));
     } else {
         zig_object.segment_free_list.append(gpa, sym.index) catch {};
         const segment = &zig_object.segment_info.items[sym.index];
         gpa.free(segment.name);
         segment.name = &.{}; // Prevent accidental double free
     }
-}
-
-fn getTypeIndex(zig_object: *const ZigObject, func_type: std.wasm.Type) ?u32 {
-    var index: u32 = 0;
-    while (index < zig_object.func_types.items.len) : (index += 1) {
-        if (zig_object.func_types.items[index].eql(func_type)) return index;
-    }
-    return null;
-}
-
-/// Searches for a matching function signature. When no matching signature is found,
-/// a new entry will be made. The value returned is the index of the type within `wasm.func_types`.
-pub fn putOrGetFuncType(zig_object: *ZigObject, gpa: std.mem.Allocator, func_type: std.wasm.Type) !u32 {
-    if (zig_object.getTypeIndex(func_type)) |index| {
-        return index;
-    }
-
-    // functype does not exist.
-    const index: u32 = @intCast(zig_object.func_types.items.len);
-    const params = try gpa.dupe(std.wasm.Valtype, func_type.params);
-    errdefer gpa.free(params);
-    const returns = try gpa.dupe(std.wasm.Valtype, func_type.returns);
-    errdefer gpa.free(returns);
-    try zig_object.func_types.append(gpa, .{
-        .params = params,
-        .returns = returns,
-    });
-    return index;
 }
 
 /// Generates an atom containing the global error set' size.
@@ -1039,7 +1014,7 @@ fn setupErrorsLen(zig_object: *ZigObject, wasm: *Wasm) !void {
 /// and symbols come from the object files instead.
 pub fn initDebugSections(zig_object: *ZigObject) !void {
     if (zig_object.dwarf == null) return; // not compiling Zig code, so no need to pre-initialize debug sections
-    std.debug.assert(zig_object.debug_info_index == null);
+    assert(zig_object.debug_info_index == null);
     // this will create an Atom and set the index for us.
     zig_object.debug_info_atom = try zig_object.createDebugSectionForIndex(&zig_object.debug_info_index, ".debug_info");
     zig_object.debug_line_atom = try zig_object.createDebugSectionForIndex(&zig_object.debug_line_index, ".debug_line");
@@ -1138,19 +1113,19 @@ pub fn parseSymbolIntoAtom(zig_object: *ZigObject, wasm: *Wasm, index: Symbol.In
     const atom = wasm.getAtom(atom_index);
     for (atom.relocs.items) |reloc| {
         const reloc_index: Symbol.Index = @enumFromInt(reloc.index);
-        switch (reloc.relocation_type) {
-            .R_WASM_TABLE_INDEX_I32,
-            .R_WASM_TABLE_INDEX_I64,
-            .R_WASM_TABLE_INDEX_SLEB,
-            .R_WASM_TABLE_INDEX_SLEB64,
+        switch (reloc.tag) {
+            .TABLE_INDEX_I32,
+            .TABLE_INDEX_I64,
+            .TABLE_INDEX_SLEB,
+            .TABLE_INDEX_SLEB64,
             => {
                 try wasm.function_table.put(gpa, .{
                     .file = .zig_object,
                     .index = reloc_index,
                 }, 0);
             },
-            .R_WASM_GLOBAL_INDEX_I32,
-            .R_WASM_GLOBAL_INDEX_LEB,
+            .GLOBAL_INDEX_I32,
+            .GLOBAL_INDEX_LEB,
             => {
                 const sym = zig_object.symbol(reloc_index);
                 if (sym.tag != .global) {
@@ -1220,6 +1195,7 @@ const link = @import("../../link.zig");
 const log = std.log.scoped(.zig_object);
 const std = @import("std");
 const Path = std.Build.Cache.Path;
+const assert = std.debug.assert;
 
 const Air = @import("../../Air.zig");
 const Atom = Wasm.Atom;
