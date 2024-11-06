@@ -6,7 +6,6 @@ const assert = std.debug.assert;
 const testing = std.testing;
 const leb = std.leb;
 const mem = std.mem;
-const wasm = std.wasm;
 const log = std.log.scoped(.codegen);
 
 const codegen = @import("../../codegen.zig");
@@ -119,7 +118,7 @@ const WValue = union(enum) {
         if (local_value < reserved + 2) return; // reserved locals may never be re-used. Also accounts for 2 stack locals.
 
         const index = local_value - reserved;
-        const valtype = @as(wasm.Valtype, @enumFromInt(gen.locals.items[index]));
+        const valtype: std.wasm.Valtype = @enumFromInt(gen.locals.items[index]);
         switch (valtype) {
             .i32 => gen.free_locals_i32.append(gen.gpa, local_value) catch return, // It's ok to fail any of those, a new local can be allocated instead
             .i64 => gen.free_locals_i64.append(gen.gpa, local_value) catch return,
@@ -230,19 +229,19 @@ const Op = enum {
 ///     --> .{ .op = .nop }
 const OpcodeBuildArguments = struct {
     /// First valtype in the opcode (usually represents the type of the output)
-    valtype1: ?wasm.Valtype = null,
+    valtype1: ?std.wasm.Valtype = null,
     /// The operation (e.g. call, unreachable, div, min, sqrt, etc.)
     op: Op,
     /// Width of the operation (e.g. 8 for i32_load8_s, 16 for i64_extend16_i32_s)
     width: ?u8 = null,
     /// Second valtype in the opcode name (usually represents the type of the input)
-    valtype2: ?wasm.Valtype = null,
+    valtype2: ?std.wasm.Valtype = null,
     /// Signedness of the op
     signedness: ?std.builtin.Signedness = null,
 };
 
 /// Helper function that builds an Opcode given the arguments needed
-fn buildOpcode(args: OpcodeBuildArguments) wasm.Opcode {
+fn buildOpcode(args: OpcodeBuildArguments) std.wasm.Opcode {
     switch (args.op) {
         .@"unreachable" => return .@"unreachable",
         .nop => return .nop,
@@ -626,11 +625,11 @@ test "Wasm - buildOpcode" {
     const i64_extend32_s = buildOpcode(.{ .op = .extend, .valtype1 = .i64, .width = 32, .signedness = .signed });
     const f64_reinterpret_i64 = buildOpcode(.{ .op = .reinterpret, .valtype1 = .f64, .valtype2 = .i64 });
 
-    try testing.expectEqual(@as(wasm.Opcode, .i32_const), i32_const);
-    try testing.expectEqual(@as(wasm.Opcode, .end), end);
-    try testing.expectEqual(@as(wasm.Opcode, .local_get), local_get);
-    try testing.expectEqual(@as(wasm.Opcode, .i64_extend32_s), i64_extend32_s);
-    try testing.expectEqual(@as(wasm.Opcode, .f64_reinterpret_i64), f64_reinterpret_i64);
+    try testing.expectEqual(@as(std.wasm.Opcode, .i32_const), i32_const);
+    try testing.expectEqual(@as(std.wasm.Opcode, .end), end);
+    try testing.expectEqual(@as(std.wasm.Opcode, .local_get), local_get);
+    try testing.expectEqual(@as(std.wasm.Opcode, .i64_extend32_s), i64_extend32_s);
+    try testing.expectEqual(@as(std.wasm.Opcode, .f64_reinterpret_i64), f64_reinterpret_i64);
 }
 
 /// Hashmap to store generated `WValue` for each `Air.Inst.Ref`
@@ -919,7 +918,7 @@ fn addTag(func: *CodeGen, tag: Mir.Inst.Tag) error{OutOfMemory}!void {
     try func.addInst(.{ .tag = tag, .data = .{ .tag = {} } });
 }
 
-fn addExtended(func: *CodeGen, opcode: wasm.MiscOpcode) error{OutOfMemory}!void {
+fn addExtended(func: *CodeGen, opcode: std.wasm.MiscOpcode) error{OutOfMemory}!void {
     const extra_index = @as(u32, @intCast(func.mir_extra.items.len));
     try func.mir_extra.append(func.gpa, @intFromEnum(opcode));
     try func.addInst(.{ .tag = .misc_prefix, .data = .{ .payload = extra_index } });
@@ -950,7 +949,7 @@ fn addImm128(func: *CodeGen, index: u32) error{OutOfMemory}!void {
     const extra_index = @as(u32, @intCast(func.mir_extra.items.len));
     // tag + 128bit value
     try func.mir_extra.ensureUnusedCapacity(func.gpa, 5);
-    func.mir_extra.appendAssumeCapacity(std.wasm.simdOpcode(.v128_const));
+    func.mir_extra.appendAssumeCapacity(@intFromEnum(std.wasm.SimdOpcode.v128_const));
     func.mir_extra.appendSliceAssumeCapacity(@alignCast(mem.bytesAsSlice(u32, &simd_values)));
     try func.addInst(.{ .tag = .simd_prefix, .data = .{ .payload = extra_index } });
 }
@@ -968,15 +967,15 @@ fn addMemArg(func: *CodeGen, tag: Mir.Inst.Tag, mem_arg: Mir.MemArg) error{OutOf
 
 /// Inserts an instruction from the 'atomics' feature which accesses wasm's linear memory dependent on the
 /// given `tag`.
-fn addAtomicMemArg(func: *CodeGen, tag: wasm.AtomicsOpcode, mem_arg: Mir.MemArg) error{OutOfMemory}!void {
-    const extra_index = try func.addExtra(@as(struct { val: u32 }, .{ .val = wasm.atomicsOpcode(tag) }));
+fn addAtomicMemArg(func: *CodeGen, tag: std.wasm.AtomicsOpcode, mem_arg: Mir.MemArg) error{OutOfMemory}!void {
+    const extra_index = try func.addExtra(@as(struct { val: u32 }, .{ .val = @intFromEnum(tag) }));
     _ = try func.addExtra(mem_arg);
     try func.addInst(.{ .tag = .atomics_prefix, .data = .{ .payload = extra_index } });
 }
 
 /// Helper function to emit atomic mir opcodes.
-fn addAtomicTag(func: *CodeGen, tag: wasm.AtomicsOpcode) error{OutOfMemory}!void {
-    const extra_index = try func.addExtra(@as(struct { val: u32 }, .{ .val = wasm.atomicsOpcode(tag) }));
+fn addAtomicTag(func: *CodeGen, tag: std.wasm.AtomicsOpcode) error{OutOfMemory}!void {
+    const extra_index = try func.addExtra(@as(struct { val: u32 }, .{ .val = @intFromEnum(tag) }));
     try func.addInst(.{ .tag = .atomics_prefix, .data = .{ .payload = extra_index } });
 }
 
@@ -1003,7 +1002,7 @@ fn addExtraAssumeCapacity(func: *CodeGen, extra: anytype) error{OutOfMemory}!u32
 }
 
 /// Using a given `Type`, returns the corresponding valtype for .auto callconv
-fn typeToValtype(ty: Type, pt: Zcu.PerThread, target: std.Target) wasm.Valtype {
+fn typeToValtype(ty: Type, pt: Zcu.PerThread, target: std.Target) std.wasm.Valtype {
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
     return switch (ty.zigTypeTag(zcu)) {
@@ -1044,7 +1043,7 @@ fn typeToValtype(ty: Type, pt: Zcu.PerThread, target: std.Target) wasm.Valtype {
 
 /// Using a given `Type`, returns the byte representation of its wasm value type
 fn genValtype(ty: Type, pt: Zcu.PerThread, target: std.Target) u8 {
-    return wasm.valtype(typeToValtype(ty, pt, target));
+    return @intFromEnum(typeToValtype(ty, pt, target));
 }
 
 /// Using a given `Type`, returns the corresponding wasm value type
@@ -1052,7 +1051,7 @@ fn genValtype(ty: Type, pt: Zcu.PerThread, target: std.Target) u8 {
 /// with no return type
 fn genBlockType(ty: Type, pt: Zcu.PerThread, target: std.Target) u8 {
     return switch (ty.ip_index) {
-        .void_type, .noreturn_type => wasm.block_empty,
+        .void_type, .noreturn_type => std.wasm.block_empty,
         else => genValtype(ty, pt, target),
     };
 }
@@ -1141,35 +1140,34 @@ fn ensureAllocLocal(func: *CodeGen, ty: Type) InnerError!WValue {
     return .{ .local = .{ .value = initial_index, .references = 1 } };
 }
 
-/// Generates a `wasm.Type` from a given function type.
-/// Memory is owned by the caller.
 fn genFunctype(
-    gpa: Allocator,
+    wasm: *link.File.Wasm,
     cc: std.builtin.CallingConvention,
     params: []const InternPool.Index,
     return_type: Type,
     pt: Zcu.PerThread,
     target: std.Target,
-) !wasm.Type {
+) !link.File.Wasm.FunctionType.Index {
     const zcu = pt.zcu;
-    var temp_params = std.ArrayList(wasm.Valtype).init(gpa);
-    defer temp_params.deinit();
-    var returns = std.ArrayList(wasm.Valtype).init(gpa);
-    defer returns.deinit();
+    const gpa = zcu.gpa;
+    var temp_params: std.ArrayListUnmanaged(std.wasm.Valtype) = .empty;
+    defer temp_params.deinit(gpa);
+    var returns: std.ArrayListUnmanaged(std.wasm.Valtype) = .empty;
+    defer returns.deinit(gpa);
 
     if (firstParamSRet(cc, return_type, pt, target)) {
-        try temp_params.append(.i32); // memory address is always a 32-bit handle
+        try temp_params.append(gpa, .i32); // memory address is always a 32-bit handle
     } else if (return_type.hasRuntimeBitsIgnoreComptime(zcu)) {
         if (cc == .wasm_watc) {
             const res_classes = abi.classifyType(return_type, zcu);
             assert(res_classes[0] == .direct and res_classes[1] == .none);
             const scalar_type = abi.scalarType(return_type, zcu);
-            try returns.append(typeToValtype(scalar_type, pt, target));
+            try returns.append(gpa, typeToValtype(scalar_type, pt, target));
         } else {
-            try returns.append(typeToValtype(return_type, pt, target));
+            try returns.append(gpa, typeToValtype(return_type, pt, target));
         }
     } else if (return_type.isError(zcu)) {
-        try returns.append(.i32);
+        try returns.append(gpa, .i32);
     }
 
     // param types
@@ -1183,24 +1181,24 @@ fn genFunctype(
                 if (param_classes[1] == .none) {
                     if (param_classes[0] == .direct) {
                         const scalar_type = abi.scalarType(param_type, zcu);
-                        try temp_params.append(typeToValtype(scalar_type, pt, target));
+                        try temp_params.append(gpa, typeToValtype(scalar_type, pt, target));
                     } else {
-                        try temp_params.append(typeToValtype(param_type, pt, target));
+                        try temp_params.append(gpa, typeToValtype(param_type, pt, target));
                     }
                 } else {
                     // i128/f128
-                    try temp_params.append(.i64);
-                    try temp_params.append(.i64);
+                    try temp_params.append(gpa, .i64);
+                    try temp_params.append(gpa, .i64);
                 }
             },
-            else => try temp_params.append(typeToValtype(param_type, pt, target)),
+            else => try temp_params.append(gpa, typeToValtype(param_type, pt, target)),
         }
     }
 
-    return wasm.Type{
-        .params = try temp_params.toOwnedSlice(),
-        .returns = try returns.toOwnedSlice(),
-    };
+    return wasm.addFuncType(.{
+        .params = try wasm.internValtypeList(temp_params.items),
+        .returns = try wasm.internValtypeList(returns.items),
+    });
 }
 
 pub fn generate(
@@ -1244,14 +1242,14 @@ pub fn generate(
 }
 
 fn genFunc(func: *CodeGen) InnerError!void {
+    const wasm = func.bin_file;
     const pt = func.pt;
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
     const fn_ty = zcu.navValue(func.owner_nav).typeOf(zcu);
     const fn_info = zcu.typeToFunc(fn_ty).?;
-    var func_type = try genFunctype(func.gpa, fn_info.cc, fn_info.param_types.get(ip), Type.fromInterned(fn_info.return_type), pt, func.target.*);
-    defer func_type.deinit(func.gpa);
-    _ = try func.bin_file.storeNavType(func.owner_nav, func_type);
+    const fn_ty_index = try genFunctype(wasm, fn_info.cc, fn_info.param_types.get(ip), Type.fromInterned(fn_info.return_type), pt, func.target.*);
+    try wasm.storeNavType(func.owner_nav, fn_ty_index);
 
     var cc_result = try func.resolveCallingConventionValues(fn_ty);
     defer cc_result.deinit(func.gpa);
@@ -1273,7 +1271,8 @@ fn genFunc(func: *CodeGen) InnerError!void {
 
     // In case we have a return value, but the last instruction is a noreturn (such as a while loop)
     // we emit an unreachable instruction to tell the stack validator that part will never be reached.
-    if (func_type.returns.len != 0 and func.air.instructions.len > 0) {
+    const returns = fn_ty_index.ptr(wasm).returns.slice(wasm);
+    if (returns.len != 0 and func.air.instructions.len > 0) {
         const inst: Air.Inst.Index = @enumFromInt(func.air.instructions.len - 1);
         const last_inst_ty = func.typeOfIndex(inst);
         if (!last_inst_ty.hasRuntimeBitsIgnoreComptime(zcu) or last_inst_ty.isNoReturn(zcu)) {
@@ -1291,7 +1290,7 @@ fn genFunc(func: *CodeGen) InnerError!void {
         var prologue = std.ArrayList(Mir.Inst).init(func.gpa);
         defer prologue.deinit();
 
-        const sp = @intFromEnum(func.bin_file.zig_object.?.stack_pointer_sym);
+        const sp = @intFromEnum(wasm.zig_object.?.stack_pointer_sym);
         // load stack pointer
         try prologue.append(.{ .tag = .global_get, .data = .{ .label = sp } });
         // store stack pointer so we can restore it when we return from the function
@@ -1328,7 +1327,7 @@ fn genFunc(func: *CodeGen) InnerError!void {
 
     var emit: Emit = .{
         .mir = mir,
-        .bin_file = func.bin_file,
+        .bin_file = wasm,
         .code = func.code,
         .locals = func.locals.items,
         .owner_nav = func.owner_nav,
@@ -1643,8 +1642,8 @@ fn memcpy(func: *CodeGen, dst: WValue, src: WValue, len: WValue) !void {
     try func.addLabel(.local_set, offset.local.value);
 
     // outer block to jump to when loop is done
-    try func.startBlock(.block, wasm.block_empty);
-    try func.startBlock(.loop, wasm.block_empty);
+    try func.startBlock(.block, std.wasm.block_empty);
+    try func.startBlock(.loop, std.wasm.block_empty);
 
     // loop condition (offset == length -> break)
     {
@@ -1792,7 +1791,7 @@ const SimdStoreStrategy = enum {
 /// features are enabled, the function will return `.direct`. This would allow to store
 /// it using a instruction, rather than an unrolled version.
 fn determineSimdStoreStrategy(ty: Type, zcu: *Zcu, target: std.Target) SimdStoreStrategy {
-    std.debug.assert(ty.zigTypeTag(zcu) == .vector);
+    assert(ty.zigTypeTag(zcu) == .vector);
     if (ty.bitSize(zcu) != 128) return .unrolled;
     const hasFeature = std.Target.wasm.featureSetHas;
     const features = target.cpu.features;
@@ -2214,23 +2213,22 @@ fn airCall(func: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModif
             .@"extern" => |@"extern"| {
                 const ext_nav = ip.getNav(@"extern".owner_nav);
                 const ext_info = zcu.typeToFunc(Type.fromInterned(@"extern".ty)).?;
-                var func_type = try genFunctype(
-                    func.gpa,
+                const func_type_index = try genFunctype(
+                    func.bin_file,
                     ext_info.cc,
                     ext_info.param_types.get(ip),
                     Type.fromInterned(ext_info.return_type),
                     pt,
                     func.target.*,
                 );
-                defer func_type.deinit(func.gpa);
                 const atom_index = try func.bin_file.getOrCreateAtomForNav(pt, @"extern".owner_nav);
                 const atom = func.bin_file.getAtomPtr(atom_index);
-                const type_index = try func.bin_file.storeNavType(@"extern".owner_nav, func_type);
+                try func.bin_file.storeNavType(@"extern".owner_nav, func_type_index);
                 try func.bin_file.addOrUpdateImport(
                     ext_nav.name.toSlice(ip),
                     atom.sym_index,
                     @"extern".lib_name.toSlice(ip),
-                    type_index,
+                    func_type_index,
                 );
                 break :blk @"extern".owner_nav;
             },
@@ -2267,15 +2265,12 @@ fn airCall(func: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModif
     } else {
         // in this case we call a function pointer
         // so load its value onto the stack
-        std.debug.assert(ty.zigTypeTag(zcu) == .pointer);
+        assert(ty.zigTypeTag(zcu) == .pointer);
         const operand = try func.resolveInst(pl_op.operand);
         try func.emitWValue(operand);
 
-        var fn_type = try genFunctype(func.gpa, fn_info.cc, fn_info.param_types.get(ip), Type.fromInterned(fn_info.return_type), pt, func.target.*);
-        defer fn_type.deinit(func.gpa);
-
-        const fn_type_index = try func.bin_file.zig_object.?.putOrGetFuncType(func.gpa, fn_type);
-        try func.addLabel(.call_indirect, fn_type_index);
+        const fn_type_index = try genFunctype(func.bin_file, fn_info.cc, fn_info.param_types.get(ip), Type.fromInterned(fn_info.return_type), pt, func.target.*);
+        try func.addLabel(.call_indirect, @intFromEnum(fn_type_index));
     }
 
     const result_value = result_value: {
@@ -2417,7 +2412,7 @@ fn store(func: *CodeGen, lhs: WValue, rhs: WValue, ty: Type, offset: u32) InnerE
                 const extra_index: u32 = @intCast(func.mir_extra.items.len);
                 // stores as := opcode, offset, alignment (opcode::memarg)
                 try func.mir_extra.appendSlice(func.gpa, &[_]u32{
-                    std.wasm.simdOpcode(.v128_store),
+                    @intFromEnum(std.wasm.SimdOpcode.v128_store),
                     offset + lhs.offset(),
                     @intCast(ty.abiAlignment(zcu).toByteUnits() orelse 0),
                 });
@@ -2532,7 +2527,7 @@ fn load(func: *CodeGen, operand: WValue, ty: Type, offset: u32) InnerError!WValu
         const extra_index = @as(u32, @intCast(func.mir_extra.items.len));
         // stores as := opcode, offset, alignment (opcode::memarg)
         try func.mir_extra.appendSlice(func.gpa, &[_]u32{
-            std.wasm.simdOpcode(.v128_load),
+            @intFromEnum(std.wasm.SimdOpcode.v128_load),
             offset + operand.offset(),
             @intCast(ty.abiAlignment(zcu).toByteUnits().?),
         });
@@ -2663,7 +2658,7 @@ fn binOp(func: *CodeGen, lhs: WValue, rhs: WValue, ty: Type, op: Op) InnerError!
         }
     }
 
-    const opcode: wasm.Opcode = buildOpcode(.{
+    const opcode: std.wasm.Opcode = buildOpcode(.{
         .op = op,
         .valtype1 = typeToValtype(ty, pt, func.target.*),
         .signedness = if (ty.isSignedInt(zcu)) .signed else .unsigned,
@@ -2987,7 +2982,7 @@ fn floatNeg(func: *CodeGen, ty: Type, arg: WValue) InnerError!WValue {
         },
         32, 64 => {
             try func.emitWValue(arg);
-            const val_type: wasm.Valtype = if (float_bits == 32) .f32 else .f64;
+            const val_type: std.wasm.Valtype = if (float_bits == 32) .f32 else .f64;
             const opcode = buildOpcode(.{ .op = .neg, .valtype1 = val_type });
             try func.addTag(Mir.Inst.Tag.fromOpcode(opcode));
             return .stack;
@@ -3496,12 +3491,12 @@ fn lowerBlock(func: *CodeGen, inst: Air.Inst.Index, block_ty: Type, body: []cons
     const wasm_block_ty = genBlockType(block_ty, pt, func.target.*);
 
     // if wasm_block_ty is non-empty, we create a register to store the temporary value
-    const block_result: WValue = if (wasm_block_ty != wasm.block_empty) blk: {
+    const block_result: WValue = if (wasm_block_ty != std.wasm.block_empty) blk: {
         const ty: Type = if (isByRef(block_ty, pt, func.target.*)) Type.u32 else block_ty;
         break :blk try func.ensureAllocLocal(ty); // make sure it's a clean local as it may never get overwritten
     } else .none;
 
-    try func.startBlock(.block, wasm.block_empty);
+    try func.startBlock(.block, std.wasm.block_empty);
     // Here we set the current block idx, so breaks know the depth to jump
     // to when breaking out.
     try func.blocks.putNoClobber(func.gpa, inst, .{
@@ -3519,7 +3514,7 @@ fn lowerBlock(func: *CodeGen, inst: Air.Inst.Index, block_ty: Type, body: []cons
 }
 
 /// appends a new wasm block to the code section and increases the `block_depth` by 1
-fn startBlock(func: *CodeGen, block_tag: wasm.Opcode, valtype: u8) !void {
+fn startBlock(func: *CodeGen, block_tag: std.wasm.Opcode, valtype: u8) !void {
     func.block_depth += 1;
     try func.addInst(.{
         .tag = Mir.Inst.Tag.fromOpcode(block_tag),
@@ -3540,7 +3535,7 @@ fn airLoop(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
 
     // result type of loop is always 'noreturn', meaning we can always
     // emit the wasm type 'block_empty'.
-    try func.startBlock(.loop, wasm.block_empty);
+    try func.startBlock(.loop, std.wasm.block_empty);
 
     try func.loops.putNoClobber(func.gpa, inst, func.block_depth);
     defer assert(func.loops.remove(inst));
@@ -3560,7 +3555,7 @@ fn airCondBr(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     const liveness_condbr = func.liveness.getCondBr(inst);
 
     // result type is always noreturn, so use `block_empty` as type.
-    try func.startBlock(.block, wasm.block_empty);
+    try func.startBlock(.block, std.wasm.block_empty);
     // emit the conditional value
     try func.emitWValue(condition);
 
@@ -3639,7 +3634,7 @@ fn cmp(func: *CodeGen, lhs: WValue, rhs: WValue, ty: Type, op: std.math.CompareO
     try func.lowerToStack(lhs);
     try func.lowerToStack(rhs);
 
-    const opcode: wasm.Opcode = buildOpcode(.{
+    const opcode: std.wasm.Opcode = buildOpcode(.{
         .valtype1 = typeToValtype(ty, pt, func.target.*),
         .op = switch (op) {
             .lt => .lt,
@@ -3681,7 +3676,7 @@ fn cmpFloat(func: *CodeGen, ty: Type, lhs: WValue, rhs: WValue, cmp_op: std.math
         32, 64 => {
             try func.emitWValue(lhs);
             try func.emitWValue(rhs);
-            const val_type: wasm.Valtype = if (float_bits == 32) .f32 else .f64;
+            const val_type: std.wasm.Valtype = if (float_bits == 32) .f32 else .f64;
             const opcode = buildOpcode(.{ .op = op, .valtype1 = val_type });
             try func.addTag(Mir.Inst.Tag.fromOpcode(opcode));
             return .stack;
@@ -4060,7 +4055,7 @@ fn airSwitchBr(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     const pt = func.pt;
     const zcu = pt.zcu;
     // result type is always 'noreturn'
-    const blocktype = wasm.block_empty;
+    const blocktype = std.wasm.block_empty;
     const switch_br = func.air.unwrapSwitch(inst);
     const target = try func.resolveInst(switch_br.operand);
     const target_ty = func.typeOf(switch_br.operand);
@@ -4252,7 +4247,7 @@ fn airSwitchBr(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     return func.finishAir(inst, .none, &.{});
 }
 
-fn airIsErr(func: *CodeGen, inst: Air.Inst.Index, opcode: wasm.Opcode) InnerError!void {
+fn airIsErr(func: *CodeGen, inst: Air.Inst.Index, opcode: std.wasm.Opcode) InnerError!void {
     const pt = func.pt;
     const zcu = pt.zcu;
     const un_op = func.air.instructions.items(.data)[@intFromEnum(inst)].un_op;
@@ -4474,7 +4469,7 @@ fn intcast(func: *CodeGen, operand: WValue, given: Type, wanted: Type) InnerErro
     } else return func.load(operand, wanted, 0);
 }
 
-fn airIsNull(func: *CodeGen, inst: Air.Inst.Index, opcode: wasm.Opcode, op_kind: enum { value, ptr }) InnerError!void {
+fn airIsNull(func: *CodeGen, inst: Air.Inst.Index, opcode: std.wasm.Opcode, op_kind: enum { value, ptr }) InnerError!void {
     const pt = func.pt;
     const zcu = pt.zcu;
     const un_op = func.air.instructions.items(.data)[@intFromEnum(inst)].un_op;
@@ -4488,7 +4483,7 @@ fn airIsNull(func: *CodeGen, inst: Air.Inst.Index, opcode: wasm.Opcode, op_kind:
 
 /// For a given type and operand, checks if it's considered `null`.
 /// NOTE: Leaves the result on the stack
-fn isNull(func: *CodeGen, operand: WValue, optional_ty: Type, opcode: wasm.Opcode) InnerError!WValue {
+fn isNull(func: *CodeGen, operand: WValue, optional_ty: Type, opcode: std.wasm.Opcode) InnerError!WValue {
     const pt = func.pt;
     const zcu = pt.zcu;
     try func.emitWValue(operand);
@@ -4974,8 +4969,8 @@ fn memset(func: *CodeGen, elem_ty: Type, ptr: WValue, len: WValue, value: WValue
     try func.addLabel(.local_set, end_ptr.local.value);
 
     // outer block to jump to when loop is done
-    try func.startBlock(.block, wasm.block_empty);
-    try func.startBlock(.loop, wasm.block_empty);
+    try func.startBlock(.block, std.wasm.block_empty);
+    try func.startBlock(.loop, std.wasm.block_empty);
 
     // check for condition for loop end
     try func.emitWValue(new_ptr);
@@ -5029,11 +5024,11 @@ fn airArrayElemVal(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
         try func.addTag(.i32_mul);
         try func.addTag(.i32_add);
     } else {
-        std.debug.assert(array_ty.zigTypeTag(zcu) == .vector);
+        assert(array_ty.zigTypeTag(zcu) == .vector);
 
         switch (index) {
             inline .imm32, .imm64 => |lane| {
-                const opcode: wasm.SimdOpcode = switch (elem_ty.bitSize(zcu)) {
+                const opcode: std.wasm.SimdOpcode = switch (elem_ty.bitSize(zcu)) {
                     8 => if (elem_ty.isSignedInt(zcu)) .i8x16_extract_lane_s else .i8x16_extract_lane_u,
                     16 => if (elem_ty.isSignedInt(zcu)) .i16x8_extract_lane_s else .i16x8_extract_lane_u,
                     32 => if (elem_ty.isInt(zcu)) .i32x4_extract_lane else .f32x4_extract_lane,
@@ -5041,7 +5036,7 @@ fn airArrayElemVal(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
                     else => unreachable,
                 };
 
-                var operands = [_]u32{ std.wasm.simdOpcode(opcode), @as(u8, @intCast(lane)) };
+                var operands = [_]u32{ @intFromEnum(opcode), @as(u8, @intCast(lane)) };
 
                 try func.emitWValue(array);
 
@@ -5178,10 +5173,10 @@ fn airSplat(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
             // the scalar value onto the stack.
             .stack_offset, .memory, .memory_offset => {
                 const opcode = switch (elem_ty.bitSize(zcu)) {
-                    8 => std.wasm.simdOpcode(.v128_load8_splat),
-                    16 => std.wasm.simdOpcode(.v128_load16_splat),
-                    32 => std.wasm.simdOpcode(.v128_load32_splat),
-                    64 => std.wasm.simdOpcode(.v128_load64_splat),
+                    8 => @intFromEnum(std.wasm.SimdOpcode.v128_load8_splat),
+                    16 => @intFromEnum(std.wasm.SimdOpcode.v128_load16_splat),
+                    32 => @intFromEnum(std.wasm.SimdOpcode.v128_load32_splat),
+                    64 => @intFromEnum(std.wasm.SimdOpcode.v128_load64_splat),
                     else => break :blk, // Cannot make use of simd-instructions
                 };
                 try func.emitWValue(operand);
@@ -5198,10 +5193,10 @@ fn airSplat(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
             },
             .local => {
                 const opcode = switch (elem_ty.bitSize(zcu)) {
-                    8 => std.wasm.simdOpcode(.i8x16_splat),
-                    16 => std.wasm.simdOpcode(.i16x8_splat),
-                    32 => if (elem_ty.isInt(zcu)) std.wasm.simdOpcode(.i32x4_splat) else std.wasm.simdOpcode(.f32x4_splat),
-                    64 => if (elem_ty.isInt(zcu)) std.wasm.simdOpcode(.i64x2_splat) else std.wasm.simdOpcode(.f64x2_splat),
+                    8 => @intFromEnum(std.wasm.SimdOpcode.i8x16_splat),
+                    16 => @intFromEnum(std.wasm.SimdOpcode.i16x8_splat),
+                    32 => if (elem_ty.isInt(zcu)) @intFromEnum(std.wasm.SimdOpcode.i32x4_splat) else @intFromEnum(std.wasm.SimdOpcode.f32x4_splat),
+                    64 => if (elem_ty.isInt(zcu)) @intFromEnum(std.wasm.SimdOpcode.i64x2_splat) else @intFromEnum(std.wasm.SimdOpcode.f64x2_splat),
                     else => break :blk, // Cannot make use of simd-instructions
                 };
                 try func.emitWValue(operand);
@@ -5274,7 +5269,7 @@ fn airShuffle(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
         return func.finishAir(inst, result, &.{ extra.a, extra.b });
     } else {
         var operands = [_]u32{
-            std.wasm.simdOpcode(.i8x16_shuffle),
+            @intFromEnum(std.wasm.SimdOpcode.i8x16_shuffle),
         } ++ [1]u32{undefined} ** 4;
 
         var lanes = mem.asBytes(operands[1..]);
@@ -5545,7 +5540,7 @@ fn cmpOptionals(func: *CodeGen, lhs: WValue, rhs: WValue, operand_ty: Type, op: 
     var result = try func.ensureAllocLocal(Type.i32);
     defer result.free(func);
 
-    try func.startBlock(.block, wasm.block_empty);
+    try func.startBlock(.block, std.wasm.block_empty);
     _ = try func.isNull(lhs, operand_ty, .i32_eq);
     _ = try func.isNull(rhs, operand_ty, .i32_eq);
     try func.addTag(.i32_ne); // inverse so we can exit early
@@ -5685,7 +5680,7 @@ fn fpext(func: *CodeGen, operand: WValue, given: Type, wanted: Type) InnerError!
             Type.f32,
             &.{operand},
         );
-        std.debug.assert(f32_result == .stack);
+        assert(f32_result == .stack);
 
         if (wanted_bits == 64) {
             try func.addTag(.f64_promote_f32);
@@ -6564,7 +6559,7 @@ fn lowerTry(
 
     if (!err_union_ty.errorUnionSet(zcu).errorSetIsEmpty(zcu)) {
         // Block we can jump out of when error is not set
-        try func.startBlock(.block, wasm.block_empty);
+        try func.startBlock(.block, std.wasm.block_empty);
 
         // check if the error tag is set for the error union.
         try func.emitWValue(err_union);
@@ -7176,9 +7171,7 @@ fn callIntrinsic(
     // Always pass over C-ABI
     const pt = func.pt;
     const zcu = pt.zcu;
-    var func_type = try genFunctype(func.gpa, .{ .wasm_watc = .{} }, param_types, return_type, pt, func.target.*);
-    defer func_type.deinit(func.gpa);
-    const func_type_index = try func.bin_file.zig_object.?.putOrGetFuncType(func.gpa, func_type);
+    const func_type_index = try genFunctype(func.bin_file, .{ .wasm_watc = .{} }, param_types, return_type, pt, func.target.*);
     try func.bin_file.addOrUpdateImport(name, symbol_index, null, func_type_index);
 
     const want_sret_param = firstParamSRet(.{ .wasm_watc = .{} }, return_type, pt, func.target.*);
@@ -7383,8 +7376,8 @@ fn getTagNameFunction(func: *CodeGen, enum_ty: Type) InnerError!u32 {
     try writer.writeByte(std.wasm.opcode(.end));
 
     const slice_ty = Type.slice_const_u8_sentinel_0;
-    const func_type = try genFunctype(arena, .Unspecified, &.{int_tag_ty.ip_index}, slice_ty, pt, func.target.*);
-    const sym_index = try func.bin_file.createFunction(func_name, func_type, &body_list, &relocs);
+    const func_type_index = try genFunctype(func.bin_file, .Unspecified, &.{int_tag_ty.ip_index}, slice_ty, pt, func.target.*);
+    const sym_index = try func.bin_file.createFunction(func_name, func_type_index, &body_list, &relocs);
     return @intFromEnum(sym_index);
 }
 
@@ -7425,11 +7418,11 @@ fn airErrorSetHasValue(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     }
 
     // start block for 'true' branch
-    try func.startBlock(.block, wasm.block_empty);
+    try func.startBlock(.block, std.wasm.block_empty);
     // start block for 'false' branch
-    try func.startBlock(.block, wasm.block_empty);
+    try func.startBlock(.block, std.wasm.block_empty);
     // block for the jump table itself
-    try func.startBlock(.block, wasm.block_empty);
+    try func.startBlock(.block, std.wasm.block_empty);
 
     // lower operand to determine jump table target
     try func.emitWValue(operand);
@@ -7556,7 +7549,7 @@ fn airAtomicLoad(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     const ty = func.typeOfIndex(inst);
 
     if (func.useAtomicFeature()) {
-        const tag: wasm.AtomicsOpcode = switch (ty.abiSize(pt.zcu)) {
+        const tag: std.wasm.AtomicsOpcode = switch (ty.abiSize(pt.zcu)) {
             1 => .i32_atomic_load8_u,
             2 => .i32_atomic_load16_u,
             4 => .i32_atomic_load,
@@ -7596,7 +7589,7 @@ fn airAtomicRmw(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
                 const value = try tmp.toLocal(func, ty);
 
                 // create a loop to cmpxchg the new value
-                try func.startBlock(.loop, wasm.block_empty);
+                try func.startBlock(.loop, std.wasm.block_empty);
 
                 try func.emitWValue(ptr);
                 try func.emitWValue(value);
@@ -7646,7 +7639,7 @@ fn airAtomicRmw(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
             else => {
                 try func.emitWValue(ptr);
                 try func.emitWValue(operand);
-                const tag: wasm.AtomicsOpcode = switch (ty.abiSize(zcu)) {
+                const tag: std.wasm.AtomicsOpcode = switch (ty.abiSize(zcu)) {
                     1 => switch (op) {
                         .Xchg => .i32_atomic_rmw8_xchg_u,
                         .Add => .i32_atomic_rmw8_add_u,
@@ -7761,7 +7754,7 @@ fn airAtomicStore(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     const ty = ptr_ty.childType(zcu);
 
     if (func.useAtomicFeature()) {
-        const tag: wasm.AtomicsOpcode = switch (ty.abiSize(zcu)) {
+        const tag: std.wasm.AtomicsOpcode = switch (ty.abiSize(zcu)) {
             1 => .i32_atomic_store8,
             2 => .i32_atomic_store16,
             4 => .i32_atomic_store,

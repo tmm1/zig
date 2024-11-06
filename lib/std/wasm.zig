@@ -4,8 +4,6 @@
 const std = @import("std.zig");
 const testing = std.testing;
 
-// TODO: Add support for multi-byte ops (e.g. table operations)
-
 /// Wasm instruction opcodes
 ///
 /// All instructions are defined as per spec:

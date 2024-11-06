@@ -13,15 +13,17 @@ pub const Index = enum(u32) {
 pub const Pointee = union {
     function: Wasm.FunctionIndex,
     function_obj: Wasm.ObjectFunctionIndex,
-    function_zo: Wasm.ObjectFunctionIndex,
+    function_zo: ZigObject.FunctionIndex,
     function_import: Wasm.FunctionImportIndex,
     function_import_obj: Wasm.ObjectFunctionImportIndex,
     function_import_zo: ZigObject.FunctionImportIndex,
-    /// This will be set to `undefined` when the symbol is undefined.
-    data: void,
+    data_out: Wasm.Segment.Index,
+    data_obj: Wasm.ObjectSegmentIndex,
+    data_zo: ZigObject.SegmentIndex,
+    data_import: void,
     global: Wasm.GlobalIndex,
     global_obj: Wasm.ObjectGlobalIndex,
-    global_zo: Wasm.ObjectGlobalIndex,
+    global_zo: ZigObject.GlobalIndex,
     global_import: Wasm.GlobalImportIndex,
     global_import_obj: Wasm.ObjectGlobalImportIndex,
     global_import_zo: ZigObject.GlobalImportIndex,
@@ -160,8 +162,8 @@ pub fn format(symbol: Symbol, comptime fmt: []const u8, options: std.fmt.FormatO
     const undef: []const u8 = if (symbol.isUndefined()) "undefined" else "";
 
     try writer.print(
-        "{c} binding={s} visible={s} id={d} name_offset={d} {s}",
-        .{ kind_fmt, binding, visible, symbol.index, symbol.name, undef },
+        "{c} binding={s} visible={s} name_offset={d} {s}",
+        .{ kind_fmt, binding, visible, symbol.name, undef },
     );
 }
 

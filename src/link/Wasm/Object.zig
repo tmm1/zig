@@ -202,16 +202,17 @@ fn parse(
                                         .data => {
                                             const name, pos = readBytes(bytes, pos);
                                             symbol.name = try wasm.internString(name);
-                                            if (!symbol.flags.undefined) {
-                                                const data_segment_index, pos = readLeb(u32, bytes, pos);
+                                            if (symbol.flags.undefined) {
+                                                symbol.pointee = .data_import;
+                                            } else {
+                                                const segment_index, pos = readLeb(u32, bytes, pos);
                                                 const segment_offset, pos = readLeb(u32, bytes, pos);
                                                 const size, pos = readLeb(u32, bytes, pos);
 
-                                                _ = data_segment_index;
+                                                symbol.pointee = .{ .data_obj = @enumFromInt(named_segments_start + segment_index) };
                                                 _ = segment_offset;
                                                 _ = size;
                                             }
-                                            symbol.pointee = .data;
                                         },
                                         .section => {
                                             const local_section, pos = readLeb(u32, bytes, pos);
