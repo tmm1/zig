@@ -538,18 +538,14 @@ fn parse(
             .code => {
                 const start = pos;
                 const count, pos = readLeb(u32, bytes, pos);
-                const function_imports_len = wasm.object_function_imports.items[function_imports_start..].len;
-                for (
-                    try wasm.object_relocatable_codes.addManyAsSlice(gpa, count),
-                    function_imports_len..,
-                ) |*elem, index| {
+                for (try wasm.object_relocatable_codes.addManyAsSlice(gpa, count), 0..) |*elem, index| {
                     const code_len, pos = readLeb(u32, bytes, pos);
                     const offset: u32 = @intCast(pos - start);
                     const payload = try wasm.addRelocatableDataPayload(bytes[pos..][0..code_len]);
                     pos += code_len;
                     elem.* = .{
                         .payload = payload,
-                        .index = @intCast(index),
+                        .function_index = @enumFromInt(functions_start + index),
                         .offset = offset,
                         .section_index = section_index,
                     };

@@ -232,6 +232,10 @@ pub const SectionIndex = enum(u32) {
 /// Index into `object_named_segments`.
 pub const ObjectSegmentIndex = enum(u32) {
     _,
+
+    pub fn ptr(index: ObjectSegmentIndex, wasm: *const Wasm) *NamedSegment {
+        return &wasm.object_named_segments.items[@intFromEnum(index)];
+    }
 };
 
 /// Index into `object_function_imports`.
@@ -337,7 +341,6 @@ pub const RelocatableData = extern struct {
     payload: Payload,
     /// The offset within the section where the data starts
     offset: u32,
-    /// Represents the index of the section it belongs to
     section_index: SectionIndex,
 
     pub const Payload = extern struct {
@@ -355,8 +358,7 @@ pub const RelocatableData = extern struct {
 pub const RelocatableCode = extern struct {
     /// The data of the segment.
     payload: Payload,
-    /// First imported function of the owning object is 0; regular functions follow.
-    function_index: u32,
+    function_index: ObjectFunctionIndex,
     /// The offset within the section where the data starts.
     offset: u32,
     section_index: SectionIndex,
@@ -373,6 +375,10 @@ pub const RelocatableCustom = extern struct {
         represented: bool = false,
     },
     section_name: String,
+
+    pub fn payload(rc: *const RelocatableCustom) RelocatableData.Payload {
+        return .{ .off = rc.data_off, .len = rc.flags.data_len };
+    }
 };
 
 pub const Global = extern struct {
@@ -1133,11 +1139,6 @@ fn objectGlobals(wasm: *const Wasm, object_id: ObjectId) []const std.wasm.Global
     return obj.globals;
 }
 
-fn objectSegmentInfo(wasm: *const Wasm, object_id: ObjectId) []const NamedSegment {
-    const obj = wasm.objectById(object_id) orelse return wasm.zig_object.?.segment_info.items;
-    return obj.segment_info;
-}
-
 /// Returns the object element pointer, or null if it is the ZigObject.
 fn objectById(wasm: *const Wasm, object_id: ObjectId) ?*Object {
     if (object_id == .zig_object) return null;
@@ -1148,7 +1149,7 @@ fn resolveSymbolsInObject(wasm: *Wasm, object_id: ObjectId) !void {
     const gpa = wasm.base.comp.gpa;
     const diags = &wasm.base.comp.link_diags;
     const obj_path = objectPath(wasm, object_id);
-    log.debug("Resolving symbols in object: '{'}'", .{obj_path});
+    log.debug("resolving symbols in object: '{'}'", .{obj_path});
     const symbols = objectSymbols(wasm, object_id);
 
     for (symbols, 0..) |symbol, i| {
@@ -1159,7 +1160,7 @@ fn resolveSymbolsInObject(wasm: *Wasm, object_id: ObjectId) !void {
         };
         if (symbol.name == wasm.preloaded_strings.__indirect_function_table) continue;
 
-        if (symbol.isLocal()) {
+        if (symbol.flags.binding == .local) {
             if (symbol.flags.undefined) {
                 diags.addParseError(obj_path, "local symbol '{s}' references import", .{
                     wasm.stringSlice(symbol.name),
@@ -1189,10 +1190,10 @@ fn resolveSymbolsInObject(wasm: *Wasm, object_id: ObjectId) !void {
 
         if (!existing_sym.flags.undefined) outer: {
             if (!symbol.flags.undefined) inner: {
-                if (symbol.isWeak()) {
+                if (symbol.flags.binding == .weak) {
                     break :inner; // ignore the new symbol (discard it)
                 }
-                if (existing_sym.isWeak()) {
+                if (existing_sym.flags.binding == .weak) {
                     break :outer; // existing is weak, while new one isn't. Replace it.
                 }
                 // both are defined and weak, we have a symbol collision.
@@ -1262,7 +1263,7 @@ fn resolveSymbolsInObject(wasm: *Wasm, object_id: ObjectId) !void {
 
         // when both symbols are weak, we skip overwriting unless the existing
         // symbol is weak and the new one isn't, in which case we *do* overwrite it.
-        if (existing_sym.isWeak() and symbol.isWeak()) blk: {
+        if (existing_sym.flags.binding == .weak and symbol.flags.binding == .weak) blk: {
             if (existing_sym.flags.undefined and !symbol.flags.undefined) break :blk;
             try wasm.discarded.put(gpa, location, existing_loc);
             continue;
@@ -1503,7 +1504,7 @@ fn setupTLSRelocationsFunction(wasm: *Wasm) !void {
     for (wasm.got_symbols.items, 0..) |got_loc, got_index| {
         const sym: *Symbol = wasm.finalSymbolByLoc(got_loc);
         if (!sym.isTLS()) continue; // only relocate TLS symbols
-        if (sym.tag == .data and sym.isDefined()) {
+        if (sym.tag == .data and !sym.flags.undefined) {
             // get __tls_base
             try writer.writeByte(@intFromEnum(std.wasm.Opcode.global_get));
             try leb.writeUleb128(writer, wasm.finalSymbolByLoc(wasm.globals.get(wasm.preloaded_strings.__tls_base).?).index);
@@ -2678,7 +2679,7 @@ pub fn getMatchingSegment(wasm: *Wasm, object_id: ObjectId, symbol_index: Symbol
 
     switch (symbol.tag) {
         .data => {
-            const segment_info = objectSegmentInfo(wasm, object_id)[symbol.index];
+            const segment_info = symbol.pointee.data_obj.ptr(wasm);
             const merge_segment = comp.config.output_mode != .Obj;
             const result = try wasm.data_segments.getOrPut(gpa, segment_info.outputName(wasm, merge_segment));
             if (!result.found_existing) {
@@ -3223,7 +3224,7 @@ fn writeToFile(
             var atom_index = wasm.atoms.get(segment_index).?;
 
             try leb.writeUleb128(binary_writer, segment.flags);
-            if (segment.flags & @intFromEnum(Segment.Flag.WASM_DATA_SEGMENT_HAS_MEMINDEX) != 0) {
+            if (segment.flags.has_memindex) {
                 try leb.writeUleb128(binary_writer, @as(u32, 0)); // memory is always index 0 as we only have 1 memory entry
             }
             // when a segment is passive, it's initialized during runtime.
@@ -3500,58 +3501,77 @@ fn emitNameSection(wasm: *Wasm, binary_bytes: *std.ArrayListUnmanaged(u8), arena
     const comp = wasm.base.comp;
     const gpa = comp.gpa;
     const import_memory = comp.config.import_memory;
-    const Name = struct {
-        index: u32,
-        name: []const u8,
 
-        fn lessThan(context: void, lhs: @This(), rhs: @This()) bool {
-            _ = context;
-            return lhs.index < rhs.index;
-        }
+    // Deduplicate symbols that point to the same function.
+    var funcs: std.AutoArrayHashMapUnmanaged(u32, String) = .empty;
+    try funcs.ensureUnusedCapacityPrecise(arena, wasm.functions.count() + wasm.function_imports.items.len);
+
+    const NamedIndex = struct {
+        index: u32,
+        name: String,
     };
 
-    // we must de-duplicate symbols that point to the same function
-    var funcs = std.AutoArrayHashMap(u32, Name).init(arena);
-    try funcs.ensureUnusedCapacity(wasm.functions.count() + wasm.imported_functions_count);
-    var globals = try std.ArrayList(Name).initCapacity(arena, wasm.output_globals.items.len + wasm.imported_globals_count);
-    var segments = try std.ArrayList(Name).initCapacity(arena, wasm.data_segments.count());
+    var globals: std.MultiArrayList(NamedIndex) = .empty;
+    try globals.ensureTotalCapacityPrecise(arena, wasm.output_globals.items.len + wasm.global_imports.items.len);
+
+    var segments: std.MultiArrayList(NamedIndex) = .empty;
+    try segments.ensureTotalCapacityPrecise(arena, wasm.data_segments.count());
 
     for (wasm.resolved_symbols.keys()) |sym_loc| {
         const symbol = wasm.finalSymbolByLoc(sym_loc).*;
         if (!symbol.flags.alive) continue;
-        const name = wasm.symbolLocName(sym_loc);
+        const name = wasm.finalSymbolByLoc(sym_loc).name;
         switch (symbol.tag) {
             .function => {
-                const gop = funcs.getOrPutAssumeCapacity(symbol.index);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = .{ .index = symbol.index, .name = name };
+                const index = if (symbol.flags.undefined)
+                    @intFromEnum(symbol.pointee.function_import)
+                else
+                    wasm.function_imports.items.len + @intFromEnum(symbol.pointee.function);
+                const gop = funcs.getOrPutAssumeCapacity(index);
+                if (gop.found_existing) {
+                    assert(gop.value_ptr.* == name);
+                } else {
+                    gop.value_ptr.* = name;
                 }
             },
-            .global => globals.appendAssumeCapacity(.{ .index = symbol.index, .name = name }),
+            .global => {
+                globals.appendAssumeCapacity(.{
+                    .index = if (symbol.flags.undefined)
+                        @intFromEnum(symbol.pointee.global_import)
+                    else
+                        @intFromEnum(symbol.pointee.global),
+                    .name = name,
+                });
+            },
             else => {},
         }
     }
-    // data segments are already 'ordered'
-    var data_segment_index: u32 = 0;
-    for (wasm.data_segments.keys()) |key| {
+
+    for (wasm.data_segments.keys(), 0..) |key, index| {
         // bss section is not emitted when this condition holds true, so we also
         // do not output a name for it.
         if (!import_memory and mem.eql(u8, key, ".bss")) continue;
-        segments.appendAssumeCapacity(.{ .index = data_segment_index, .name = key });
-        data_segment_index += 1;
+        segments.appendAssumeCapacity(.{ .index = @intCast(index), .name = key });
     }
 
-    mem.sort(Name, funcs.values(), {}, Name.lessThan);
-    mem.sort(Name, globals.items, {}, Name.lessThan);
+    const Sort = struct {
+        indexes: []const u32,
+        pub fn lessThan(ctx: @This(), lhs: usize, rhs: usize) bool {
+            return ctx.indexes[lhs] < ctx.indexes[rhs];
+        }
+    };
+    funcs.entries.sortUnstable(@as(Sort, .{ .indexes = funcs.keys() }));
+    globals.sortUnstable(@as(Sort, .{ .indexes = globals.items(.index) }));
+    // Data segments are already ordered.
 
     const header_offset = try reserveCustomSectionHeader(gpa, binary_bytes);
     const writer = binary_bytes.writer();
     try leb.writeUleb128(writer, @as(u32, @intCast("name".len)));
     try writer.writeAll("name");
 
-    try wasm.emitNameSubsection(.function, funcs.values(), writer);
-    try wasm.emitNameSubsection(.global, globals.items, writer);
-    try wasm.emitNameSubsection(.data_segment, segments.items, writer);
+    try emitNameSubsection(wasm, binary_bytes, .function, funcs.keys(), funcs.values());
+    try emitNameSubsection(wasm, binary_bytes, .global, globals.items(.index), globals.items(.name));
+    try emitNameSubsection(wasm, binary_bytes, .data_segment, segments.items(.index), segments.items(.name));
 
     try writeCustomSectionHeader(
         binary_bytes.items,
@@ -3560,26 +3580,34 @@ fn emitNameSection(wasm: *Wasm, binary_bytes: *std.ArrayListUnmanaged(u8), arena
     );
 }
 
-fn emitNameSubsection(wasm: *Wasm, section_id: std.wasm.NameSubsection, names: anytype, writer: anytype) !void {
+fn emitNameSubsection(
+    wasm: *const Wasm,
+    binary_bytes: *std.ArrayListUnmanaged(u8),
+    section_id: std.wasm.NameSubsection,
+    indexes: []const u32,
+    names: []const String,
+) !void {
+    assert(indexes.len == names.len);
     const gpa = wasm.base.comp.gpa;
-
     // We must emit subsection size, so first write to a temporary list
-    var section_list = std.ArrayList(u8).init(gpa);
-    defer section_list.deinit();
-    const sub_writer = section_list.writer();
+    var section_list: std.ArrayListUnmanaged(u8) = .empty;
+    defer section_list.deinit(gpa);
+    const sub_writer = section_list.writer(gpa);
 
     try leb.writeUleb128(sub_writer, @as(u32, @intCast(names.len)));
-    for (names) |name| {
-        log.debug("Emit symbol '{s}' type({s})", .{ name.name, @tagName(section_id) });
-        try leb.writeUleb128(sub_writer, name.index);
-        try leb.writeUleb128(sub_writer, @as(u32, @intCast(name.name.len)));
-        try sub_writer.writeAll(name.name);
+    for (indexes, names) |index, name_index| {
+        const name = wasm.stringSlice(name_index);
+        log.debug("emit symbol '{s}' type({s})", .{ name, @tagName(section_id) });
+        try leb.writeUleb128(sub_writer, index);
+        try leb.writeUleb128(sub_writer, @as(u32, @intCast(name.len)));
+        try sub_writer.writeAll(name);
     }
 
     // From now, write to the actual writer
+    const writer = binary_bytes.writer(gpa);
     try leb.writeUleb128(writer, @intFromEnum(section_id));
     try leb.writeUleb128(writer, @as(u32, @intCast(section_list.items.len)));
-    try writer.writeAll(section_list.items);
+    try binary_bytes.appendSlice(gpa, section_list.items);
 }
 
 fn emitLimits(writer: anytype, limits: std.wasm.Limits) !void {
@@ -4095,21 +4123,22 @@ fn emitLinkSection(
 
 fn emitSymbolTable(
     wasm: *Wasm,
-    binary_bytes: *std.ArrayList(u8),
-    symbol_table: *std.AutoArrayHashMap(SymbolLoc, u32),
+    binary_bytes: *std.ArrayListUnmanaged(u8),
+    symbol_table: *std.AutoArrayHashMapUnmanaged(SymbolLoc, u32),
 ) !void {
-    const writer = binary_bytes.writer();
+    const gpa = wasm.base.comp.gpa;
+    const writer = binary_bytes.writer(gpa);
 
-    try leb.writeUleb128(writer, @intFromEnum(SubsectionType.WASM_SYMBOL_TABLE));
+    try leb.writeUleb128(writer, @intFromEnum(SubsectionType.symbol_table));
     const table_offset = binary_bytes.items.len;
 
     var symbol_count: u32 = 0;
     for (wasm.resolved_symbols.keys()) |sym_loc| {
         const symbol = wasm.finalSymbolByLoc(sym_loc).*;
-        if (symbol.tag == .dead) continue; // Do not emit dead symbols
-        try symbol_table.putNoClobber(sym_loc, symbol_count);
+        if (symbol.tag == .dead) continue;
+        try symbol_table.putNoClobber(gpa, sym_loc, symbol_count);
         symbol_count += 1;
-        log.debug("Emit symbol: {}", .{symbol});
+        log.debug("emit symbol: {}", .{symbol});
         try leb.writeUleb128(writer, @intFromEnum(symbol.tag));
         try leb.writeUleb128(writer, symbol.flags);
 
@@ -4119,8 +4148,8 @@ fn emitSymbolTable(
                 try leb.writeUleb128(writer, @as(u32, @intCast(sym_name.len)));
                 try writer.writeAll(sym_name);
 
-                if (symbol.isDefined()) {
-                    try leb.writeUleb128(writer, symbol.index);
+                if (!symbol.flags.undefined) {
+                    try leb.writeUleb128(writer, @intFromEnum(symbol.pointee.data_out));
                     const atom_index = wasm.symbol_atom.get(sym_loc).?;
                     const atom = wasm.getAtom(atom_index);
                     try leb.writeUleb128(writer, @as(u32, atom.offset));
@@ -4128,15 +4157,38 @@ fn emitSymbolTable(
                 }
             },
             .section => {
-                try leb.writeUleb128(writer, symbol.index);
+                try leb.writeUleb128(writer, @intFromEnum(symbol.pointee.section));
             },
-            else => {
-                try leb.writeUleb128(writer, symbol.index);
-                if (symbol.isDefined()) {
+            .function => {
+                if (symbol.flags.undefined) {
+                    try leb.writeUleb128(writer, @intFromEnum(symbol.pointee.function_import));
+                } else {
+                    try leb.writeUleb128(writer, @intFromEnum(symbol.pointee.function));
                     try leb.writeUleb128(writer, @as(u32, @intCast(sym_name.len)));
                     try writer.writeAll(sym_name);
                 }
             },
+            .global => {
+                if (symbol.flags.undefined) {
+                    try leb.writeUleb128(writer, @intFromEnum(symbol.pointee.global_import));
+                } else {
+                    try leb.writeUleb128(writer, @intFromEnum(symbol.pointee.global));
+                    try leb.writeUleb128(writer, @as(u32, @intCast(sym_name.len)));
+                    try writer.writeAll(sym_name);
+                }
+            },
+            .table => {
+                if (symbol.flags.undefined) {
+                    try leb.writeUleb128(writer, @intFromEnum(symbol.pointee.table_import));
+                } else {
+                    try leb.writeUleb128(writer, @intFromEnum(symbol.pointee.table));
+                    try leb.writeUleb128(writer, @as(u32, @intCast(sym_name.len)));
+                    try writer.writeAll(sym_name);
+                }
+            },
+            .event => unreachable,
+            .dead => unreachable,
+            .uninitialized => unreachable,
         }
     }
 
@@ -4148,7 +4200,7 @@ fn emitSymbolTable(
 
 fn emitSegmentInfo(wasm: *Wasm, binary_bytes: *std.ArrayList(u8)) !void {
     const writer = binary_bytes.writer();
-    try leb.writeUleb128(writer, @intFromEnum(SubsectionType.WASM_SEGMENT_INFO));
+    try leb.writeUleb128(writer, @intFromEnum(SubsectionType.segment_info));
     const segment_offset = binary_bytes.items.len;
 
     try leb.writeUleb128(writer, @as(u32, @intCast(wasm.segment_info.count())));
@@ -4525,17 +4577,26 @@ fn atomRelocationValue(wasm: *const Wasm, atom: *const Atom, relocation: *const 
         const val = atom.tombstone(wasm) orelse relocation.addend;
         return @bitCast(val);
     }
-    switch (relocation.tag) {
-        .FUNCTION_INDEX_LEB => return symbol.index,
-        .TABLE_NUMBER_LEB => return symbol.index,
+    return switch (relocation.tag) {
+        .FUNCTION_INDEX_LEB => if (symbol.flags.undefined)
+            @intFromEnum(symbol.pointee.function_import)
+        else
+            @intFromEnum(symbol.pointee.function) + wasm.function_imports.items.len,
+        .TABLE_NUMBER_LEB => if (symbol.flags.undefined)
+            @intFromEnum(symbol.pointee.table_import)
+        else
+            @intFromEnum(symbol.pointee.table) + wasm.table_imports.items.len,
         .TABLE_INDEX_I32,
         .TABLE_INDEX_I64,
         .TABLE_INDEX_SLEB,
         .TABLE_INDEX_SLEB64,
-        => return wasm.function_table.get(.{ .file = atom.file, .index = @enumFromInt(relocation.index) }) orelse 0,
+        => wasm.function_table.get(.{ .file = atom.file, .index = @enumFromInt(relocation.index) }) orelse 0,
 
         .TYPE_INDEX_LEB => unreachable, // handled above
-        .GLOBAL_INDEX_I32, .GLOBAL_INDEX_LEB => return symbol.index,
+        .GLOBAL_INDEX_I32, .GLOBAL_INDEX_LEB => if (symbol.flags.undefined)
+            @intFromEnum(symbol.pointee.global_import)
+        else
+            @intFromEnum(symbol.pointee.global) + wasm.global_imports.items.len,
 
         .MEMORY_ADDR_I32,
         .MEMORY_ADDR_I64,
@@ -4545,17 +4606,15 @@ fn atomRelocationValue(wasm: *const Wasm, atom: *const Atom, relocation: *const 
         .MEMORY_ADDR_SLEB64,
         => {
             assert(symbol.tag == .data);
-            if (symbol.flags.undefined) {
-                return 0;
-            }
-            const va: i33 = @intCast(symbol.virtual_address);
+            if (symbol.flags.undefined) return 0;
+            const va: i33 = symbol.virtual_address;
             return @intCast(va + relocation.addend);
         },
-        .EVENT_INDEX_LEB => return symbol.index,
+        .EVENT_INDEX_LEB => @panic("TODO: expose this as an error, events are unsupported"),
         .SECTION_OFFSET_I32 => {
             const target_atom_index = wasm.symbol_atom.get(target_loc).?;
             const target_atom = wasm.getAtom(target_atom_index);
-            const rel_value: i33 = @intCast(target_atom.offset);
+            const rel_value: i33 = target_atom.offset;
             return @intCast(rel_value + relocation.addend);
         },
         .FUNCTION_OFFSET_I32 => {
@@ -4565,16 +4624,16 @@ fn atomRelocationValue(wasm: *const Wasm, atom: *const Atom, relocation: *const 
             }
             const target_atom_index = wasm.symbol_atom.get(target_loc).?;
             const target_atom = wasm.getAtom(target_atom_index);
-            const rel_value: i33 = @intCast(target_atom.offset);
+            const rel_value: i33 = target_atom.offset;
             return @intCast(rel_value + relocation.addend);
         },
         .MEMORY_ADDR_TLS_SLEB,
         .MEMORY_ADDR_TLS_SLEB64,
         => {
-            const va: i33 = @intCast(symbol.virtual_address);
+            const va: i33 = symbol.virtual_address;
             return @intCast(va + relocation.addend);
         },
-    }
+    };
 }
 
 // For a given `Atom` returns whether it has a tombstone value or not.
@@ -4882,18 +4941,25 @@ fn parseSymbolIntoAtom(wasm: *Wasm, object_id: ObjectId, symbol_index: Symbol.In
     const comp = wasm.base.comp;
     const gpa = comp.gpa;
     const symbol = objectSymbol(wasm, object_id, symbol_index);
-    const relocatable_data: RelocatableData = switch (symbol.tag) {
-        .function => object.relocatable_data.get(.code).?[symbol.index - object.imported_functions_count],
-        .data => object.relocatable_data.get(.data).?[symbol.index],
-        .section => blk: {
-            const data = object.relocatable_data.get(.custom).?;
+    const alignment, const payload, const offset, const section_index = switch (symbol.tag) {
+        .function => b: {
+            const rc = &wasm.object_relocatable_codes.items[@intFromEnum(symbol.pointee.function_obj)];
+            break :b .{ .@"1", rc.payload, rc.offset, rc.section_index };
+        },
+        .data => b: {
+            const rd = &wasm.object_relocatable_datas.items[@intFromEnum(symbol.pointee.data_obj)];
+            const alignment = symbol.pointee.data_obj.ptr(wasm).alignment;
+            break :b .{ alignment, rd.payload, rd.offset, rd.section_index };
+        },
+        .section => b: {
+            const section_index = symbol.pointee.section;
+            const obj = &wasm.objects.items[@intFromEnum(object_id)];
+            const relocatable_customs = wasm.object_relocatable_customs.items[0..obj.relocatable_custom.off][0..obj.relocatable_custom.len];
             _ = @import("../main.zig").@"bad O(N)";
-            for (data) |dat| {
-                if (dat.section_index == symbol.index) {
-                    break :blk dat;
-                }
-            }
-            unreachable;
+            const rc = for (relocatable_customs) |*rc| {
+                if (rc.section_index == section_index) break rc;
+            } else unreachable;
+            break :b .{ .@"1", rc.payload(), rc.offset, section_index };
         },
         else => unreachable,
     };
@@ -4902,18 +4968,16 @@ fn parseSymbolIntoAtom(wasm: *Wasm, object_id: ObjectId, symbol_index: Symbol.In
     try wasm.appendAtomAtIndex(final_index, atom_index);
 
     const atom = wasm.atomPtr(atom_index);
-    atom.alignment = relocatable_data.getAlignment(object);
-    atom.code = relocatable_data.payload;
-    atom.original_offset = relocatable_data.offset;
+    atom.alignment = alignment;
+    atom.code = payload;
+    atom.original_offset = offset;
 
     const segment = final_index.ptr(wasm);
-    if (relocatable_data.type == .data) { //code section and custom sections are 1-byte aligned
-        segment.alignment = segment.alignment.max(atom.alignment);
-    }
+    segment.alignment = segment.alignment.maxStrict(alignment);
 
-    if (object.relocations.get(relocatable_data.section_index)) |relocations| {
-        const start = searchRelocStart(relocations, relocatable_data.offset);
-        const len = searchRelocEnd(relocations[start..], relocatable_data.offset + atom.code.len);
+    if (object.relocations_table.get(section_index)) |relocations| {
+        const start = searchRelocStart(relocations, offset);
+        const len = searchRelocEnd(relocations[start..], offset + atom.code.len);
         atom.relocs = std.ArrayListUnmanaged(Relocation).fromOwnedSlice(relocations[start..][0..len]);
         for (atom.relocs.items) |reloc| {
             switch (reloc.tag) {
