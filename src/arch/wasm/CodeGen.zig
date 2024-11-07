@@ -2184,6 +2184,7 @@ fn airRetLoad(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
 }
 
 fn airCall(func: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModifier) InnerError!void {
+    const wasm = func.bin_file;
     if (modifier == .always_tail) return func.fail("TODO implement tail calls for wasm", .{});
     const pl_op = func.air.instructions.items(.data)[@intFromEnum(inst)].pl_op;
     const extra = func.air.extraData(Air.Call, pl_op.payload);
@@ -2207,24 +2208,24 @@ fn airCall(func: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModif
 
         switch (ip.indexToKey(func_val.toIntern())) {
             .func => |function| {
-                _ = try func.bin_file.getOrCreateAtomForNav(pt, function.owner_nav);
+                _ = try wasm.getOrCreateAtomForNav(pt, function.owner_nav);
                 break :blk function.owner_nav;
             },
             .@"extern" => |@"extern"| {
                 const ext_nav = ip.getNav(@"extern".owner_nav);
                 const ext_info = zcu.typeToFunc(Type.fromInterned(@"extern".ty)).?;
                 const func_type_index = try genFunctype(
-                    func.bin_file,
+                    wasm,
                     ext_info.cc,
                     ext_info.param_types.get(ip),
                     Type.fromInterned(ext_info.return_type),
                     pt,
                     func.target.*,
                 );
-                const atom_index = try func.bin_file.getOrCreateAtomForNav(pt, @"extern".owner_nav);
-                const atom = func.bin_file.getAtomPtr(atom_index);
-                try func.bin_file.storeNavType(@"extern".owner_nav, func_type_index);
-                try func.bin_file.addOrUpdateImport(
+                const atom_index = try wasm.getOrCreateAtomForNav(pt, @"extern".owner_nav);
+                const atom = atom_index.ptr(wasm);
+                try wasm.storeNavType(@"extern".owner_nav, func_type_index);
+                try wasm.addOrUpdateImport(
                     ext_nav.name.toSlice(ip),
                     atom.sym_index,
                     @"extern".lib_name.toSlice(ip),
@@ -2234,7 +2235,7 @@ fn airCall(func: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModif
             },
             .ptr => |ptr| if (ptr.byte_offset == 0) switch (ptr.base_addr) {
                 .nav => |nav| {
-                    _ = try func.bin_file.getOrCreateAtomForNav(pt, nav);
+                    _ = try wasm.getOrCreateAtomForNav(pt, nav);
                     break :blk nav;
                 },
                 else => {},
@@ -2260,8 +2261,8 @@ fn airCall(func: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModif
     }
 
     if (callee) |direct| {
-        const atom_index = func.bin_file.zig_object.?.navs.get(direct).?.atom;
-        try func.addLabel(.call, @intFromEnum(func.bin_file.getAtom(atom_index).sym_index));
+        const atom_index = wasm.zig_object.?.navs.get(direct).?.atom;
+        try func.addLabel(.call, @intFromEnum(wasm.getAtom(atom_index).sym_index));
     } else {
         // in this case we call a function pointer
         // so load its value onto the stack
@@ -2269,7 +2270,7 @@ fn airCall(func: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModif
         const operand = try func.resolveInst(pl_op.operand);
         try func.emitWValue(operand);
 
-        const fn_type_index = try genFunctype(func.bin_file, fn_info.cc, fn_info.param_types.get(ip), Type.fromInterned(fn_info.return_type), pt, func.target.*);
+        const fn_type_index = try genFunctype(wasm, fn_info.cc, fn_info.param_types.get(ip), Type.fromInterned(fn_info.return_type), pt, func.target.*);
         try func.addLabel(.call_indirect, @intFromEnum(fn_type_index));
     }
 
@@ -7253,7 +7254,7 @@ fn getTagNameFunction(func: *CodeGen, enum_ty: Type) InnerError!u32 {
     try leb.writeUleb128(writer, @as(u32, 0));
 
     // outer block
-    try writer.writeByte(std.wasm.opcode(.block));
+    try writer.writeByte(@intFromEnum(std.wasm.Opcode.block));
     try writer.writeByte(std.wasm.block_empty);
 
     // TODO: Make switch implementation generic so we can use a jump table for this when the tags are not sparse.
@@ -7282,11 +7283,11 @@ fn getTagNameFunction(func: *CodeGen, enum_ty: Type) InnerError!u32 {
         };
 
         // block for this if case
-        try writer.writeByte(std.wasm.opcode(.block));
+        try writer.writeByte(@intFromEnum(std.wasm.Opcode.block));
         try writer.writeByte(std.wasm.block_empty);
 
         // get actual tag value (stored in 2nd parameter);
-        try writer.writeByte(std.wasm.opcode(.local_get));
+        try writer.writeByte(@intFromEnum(std.wasm.Opcode.local_get));
         try leb.writeUleb128(writer, @as(u32, 1));
 
         const tag_val = try pt.enumValueFieldIndex(enum_ty, @intCast(tag_index));
@@ -7294,32 +7295,32 @@ fn getTagNameFunction(func: *CodeGen, enum_ty: Type) InnerError!u32 {
 
         switch (tag_value) {
             .imm32 => |value| {
-                try writer.writeByte(std.wasm.opcode(.i32_const));
+                try writer.writeByte(@intFromEnum(std.wasm.Opcode.i32_const));
                 try leb.writeIleb128(writer, @as(i32, @bitCast(value)));
-                try writer.writeByte(std.wasm.opcode(.i32_ne));
+                try writer.writeByte(@intFromEnum(std.wasm.Opcode.i32_ne));
             },
             .imm64 => |value| {
-                try writer.writeByte(std.wasm.opcode(.i64_const));
+                try writer.writeByte(@intFromEnum(std.wasm.Opcode.i64_const));
                 try leb.writeIleb128(writer, @as(i64, @bitCast(value)));
-                try writer.writeByte(std.wasm.opcode(.i64_ne));
+                try writer.writeByte(@intFromEnum(std.wasm.Opcode.i64_ne));
             },
             else => unreachable,
         }
         // if they're not equal, break out of current branch
-        try writer.writeByte(std.wasm.opcode(.br_if));
+        try writer.writeByte(@intFromEnum(std.wasm.Opcode.br_if));
         try leb.writeUleb128(writer, @as(u32, 0));
 
         // store the address of the tagname in the pointer field of the slice
         // get the address twice so we can also store the length.
-        try writer.writeByte(std.wasm.opcode(.local_get));
+        try writer.writeByte(@intFromEnum(std.wasm.Opcode.local_get));
         try leb.writeUleb128(writer, @as(u32, 0));
-        try writer.writeByte(std.wasm.opcode(.local_get));
+        try writer.writeByte(@intFromEnum(std.wasm.Opcode.local_get));
         try leb.writeUleb128(writer, @as(u32, 0));
 
         // get address of tagname and emit a relocation to it
         if (func.arch() == .wasm32) {
             const encoded_alignment = @ctz(@as(u32, 4));
-            try writer.writeByte(std.wasm.opcode(.i32_const));
+            try writer.writeByte(@intFromEnum(std.wasm.Opcode.i32_const));
             try relocs.append(.{
                 .tag = .R_WASM_MEMORY_ADDR_LEB,
                 .offset = @as(u32, @intCast(body_list.items.len)),
@@ -7328,19 +7329,19 @@ fn getTagNameFunction(func: *CodeGen, enum_ty: Type) InnerError!u32 {
             try writer.writeAll(&[_]u8{0} ** 5); // will be relocated
 
             // store pointer
-            try writer.writeByte(std.wasm.opcode(.i32_store));
+            try writer.writeByte(@intFromEnum(std.wasm.Opcode.i32_store));
             try leb.writeUleb128(writer, encoded_alignment);
             try leb.writeUleb128(writer, @as(u32, 0));
 
             // store length
-            try writer.writeByte(std.wasm.opcode(.i32_const));
+            try writer.writeByte(@intFromEnum(std.wasm.Opcode.i32_const));
             try leb.writeUleb128(writer, @as(u32, @intCast(tag_name_len)));
-            try writer.writeByte(std.wasm.opcode(.i32_store));
+            try writer.writeByte(@intFromEnum(std.wasm.Opcode.i32_store));
             try leb.writeUleb128(writer, encoded_alignment);
             try leb.writeUleb128(writer, @as(u32, 4));
         } else {
             const encoded_alignment = @ctz(@as(u32, 8));
-            try writer.writeByte(std.wasm.opcode(.i64_const));
+            try writer.writeByte(@intFromEnum(std.wasm.Opcode.i64_const));
             try relocs.append(.{
                 .tag = .R_WASM_MEMORY_ADDR_LEB64,
                 .offset = @as(u32, @intCast(body_list.items.len)),
@@ -7349,31 +7350,31 @@ fn getTagNameFunction(func: *CodeGen, enum_ty: Type) InnerError!u32 {
             try writer.writeAll(&[_]u8{0} ** 10); // will be relocated
 
             // store pointer
-            try writer.writeByte(std.wasm.opcode(.i64_store));
+            try writer.writeByte(@intFromEnum(std.wasm.Opcode.i64_store));
             try leb.writeUleb128(writer, encoded_alignment);
             try leb.writeUleb128(writer, @as(u32, 0));
 
             // store length
-            try writer.writeByte(std.wasm.opcode(.i64_const));
+            try writer.writeByte(@intFromEnum(std.wasm.Opcode.i64_const));
             try leb.writeUleb128(writer, @as(u64, @intCast(tag_name_len)));
-            try writer.writeByte(std.wasm.opcode(.i64_store));
+            try writer.writeByte(@intFromEnum(std.wasm.Opcode.i64_store));
             try leb.writeUleb128(writer, encoded_alignment);
             try leb.writeUleb128(writer, @as(u32, 8));
         }
 
         // break outside blocks
-        try writer.writeByte(std.wasm.opcode(.br));
+        try writer.writeByte(@intFromEnum(std.wasm.Opcode.br));
         try leb.writeUleb128(writer, @as(u32, 1));
 
         // end the block for this case
-        try writer.writeByte(std.wasm.opcode(.end));
+        try writer.writeByte(@intFromEnum(std.wasm.Opcode.end));
     }
 
-    try writer.writeByte(std.wasm.opcode(.@"unreachable")); // tag value does not have a name
+    try writer.writeByte(@intFromEnum(std.wasm.Opcode.@"unreachable")); // tag value does not have a name
     // finish outer block
-    try writer.writeByte(std.wasm.opcode(.end));
+    try writer.writeByte(@intFromEnum(std.wasm.Opcode.end));
     // finish function body
-    try writer.writeByte(std.wasm.opcode(.end));
+    try writer.writeByte(@intFromEnum(std.wasm.Opcode.end));
 
     const slice_ty = Type.slice_const_u8_sentinel_0;
     const func_type_index = try genFunctype(func.bin_file, .Unspecified, &.{int_tag_ty.ip_index}, slice_ty, pt, func.target.*);

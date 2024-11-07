@@ -78,9 +78,9 @@ pub const Inst = struct {
         ///
         /// Uses `nop`
         @"return" = 0x0F,
-        /// Calls a function by its index
+        /// Calls a function by its index.
         ///
-        /// Uses `label`
+        /// Uses `label`.
         call = 0x10,
         /// Calls a function pointer by its function signature
         /// and index into the function table.

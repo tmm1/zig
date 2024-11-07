@@ -5,8 +5,8 @@
 /// For error reporting purposes only.
 path: Path,
 /// Map of all `Nav` that are currently alive.
-/// Each index maps to the corresponding `NavInfo`.
-navs: std.AutoHashMapUnmanaged(InternPool.Nav.Index, NavInfo) = .empty,
+/// Each index maps to the corresponding `Nav`.
+navs: std.AutoArrayHashMapUnmanaged(InternPool.Nav.Index, Nav) = .empty,
 /// Each entry contains the function signature rather than the actual body.
 functions: std.ArrayListUnmanaged(Wasm.FunctionType.Index) = .empty,
 /// List of indexes pointing to an entry within the `functions` list which has been removed.
@@ -112,22 +112,22 @@ pub const SegmentIndex = enum(u32) {
     }
 };
 
-const NavInfo = struct {
+const Nav = struct {
     atom: Atom.Index,
     exports: std.ArrayListUnmanaged(Symbol.Index),
 
-    fn @"export"(ni: NavInfo, zo: *const ZigObject, name: Wasm.String) ?Symbol.Index {
+    fn @"export"(ni: Nav, zo: *const ZigObject, name: Wasm.String) ?Symbol.Index {
         for (ni.exports.items) |sym_index| {
             if (zo.symbol(sym_index).name == name) return sym_index;
         }
         return null;
     }
 
-    fn appendExport(ni: *NavInfo, gpa: std.mem.Allocator, sym_index: Symbol.Index) !void {
+    fn appendExport(ni: *Nav, gpa: std.mem.Allocator, sym_index: Symbol.Index) !void {
         return ni.exports.append(gpa, sym_index);
     }
 
-    fn deleteExport(ni: *NavInfo, sym_index: Symbol.Index) void {
+    fn deleteExport(ni: *Nav, sym_index: Symbol.Index) void {
         for (ni.exports.items, 0..) |idx, index| {
             if (idx == sym_index) {
                 _ = ni.exports.swapRemove(index);
@@ -245,7 +245,7 @@ pub fn updateNav(
     if (nav_init.typeOf(zcu).hasRuntimeBits(zcu)) {
         const gpa = wasm.base.comp.gpa;
         const atom_index = try zig_object.getOrCreateAtomForNav(wasm, pt, nav_index);
-        const atom = wasm.atomPtr(atom_index);
+        const atom = atom_index.ptr(wasm);
         atom.clear();
 
         if (is_extern)
@@ -287,7 +287,7 @@ pub fn updateFunc(
     const gpa = zcu.gpa;
     const func = pt.zcu.funcInfo(func_index);
     const atom_index = try zig_object.getOrCreateAtomForNav(wasm, pt, func.owner_nav);
-    const atom = wasm.atomPtr(atom_index);
+    const atom = atom_index.ptr(wasm);
     atom.clear();
 
     var code_writer = std.ArrayList(u8).init(gpa);
@@ -328,7 +328,7 @@ fn finishUpdateNav(
     const nav_val = zcu.navValue(nav_index);
     const nav_info = zig_object.navs.get(nav_index).?;
     const atom_index = nav_info.atom;
-    const atom = wasm.atomPtr(atom_index);
+    const atom = atom_index.ptr(wasm);
     const sym = zig_object.symbol(atom.sym_index);
     sym.name = try wasm.internString(nav.fqn.toSlice(ip));
     try atom.code.appendSlice(gpa, code);
@@ -444,7 +444,7 @@ pub fn lowerUav(
         }
     }
 
-    const atom = wasm.atomPtr(zig_object.uavs.values()[gop.index]);
+    const atom = zig_object.uavs.values()[gop.index].ptr(wasm);
     atom.alignment = switch (atom.alignment) {
         .none => explicit_alignment,
         else => switch (explicit_alignment) {
@@ -480,7 +480,7 @@ fn lowerConst(
     defer value_bytes.deinit();
 
     const code = code: {
-        const atom = wasm.atomPtr(atom_index);
+        const atom = atom_index.ptr(wasm);
         atom.alignment = ty.abiAlignment(zcu);
         const segment_name = try std.mem.concat(gpa, u8, &.{ ".rodata.", name });
         errdefer gpa.free(segment_name);
@@ -514,7 +514,7 @@ fn lowerConst(
         };
     };
 
-    const atom = wasm.atomPtr(atom_index);
+    const atom = atom_index.ptr(wasm);
     atom.size = @intCast(code.len);
     try atom.code.appendSlice(gpa, code);
     return .{ .ok = atom_index };
@@ -532,7 +532,7 @@ pub fn getErrorTableSymbol(zig_object: *ZigObject, wasm: *Wasm, pt: Zcu.PerThrea
     const gpa = wasm.base.comp.gpa;
     const sym_index = try zig_object.allocateSymbol(gpa);
     const atom_index = try wasm.createAtom(sym_index, .zig_object);
-    const atom = wasm.atomPtr(atom_index);
+    const atom = atom_index.ptr(wasm);
     const slice_ty = Type.slice_const_u8_sentinel_0;
     atom.alignment = slice_ty.abiAlignment(pt.zcu);
 
@@ -567,7 +567,7 @@ fn populateErrorNameTable(zig_object: *ZigObject, wasm: *Wasm, tid: Zcu.PerThrea
     // the pointers into the list using addends which are appended to the relocation.
     const names_sym_index = try zig_object.allocateSymbol(gpa);
     const names_atom_index = try wasm.createAtom(names_sym_index, .zig_object);
-    const names_atom = wasm.atomPtr(names_atom_index);
+    const names_atom = names_atom_index.ptr(wasm);
     names_atom.alignment = .@"1";
     const segment_name = try gpa.dupe(u8, ".rodata.__zig_err_names");
     const names_symbol = zig_object.symbol(names_sym_index);
@@ -587,7 +587,7 @@ fn populateErrorNameTable(zig_object: *ZigObject, wasm: *Wasm, tid: Zcu.PerThrea
     var addend: u32 = 0;
     const pt: Zcu.PerThread = .{ .zcu = wasm.base.comp.zcu.?, .tid = tid };
     const slice_ty = Type.slice_const_u8_sentinel_0;
-    const atom = wasm.atomPtr(atom_index);
+    const atom = atom_index.ptr(wasm);
     {
         // TODO: remove this unreachable entry
         try atom.code.appendNTimes(gpa, 0, 4);
@@ -746,7 +746,7 @@ pub fn getNavVAddr(
         .file = .zig_object,
         .index = @enumFromInt(reloc_info.parent.atom_index),
     }).?;
-    const atom = wasm.atomPtr(atom_index);
+    const atom = atom_index.ptr(wasm);
     const is_wasm32 = target.cpu.arch == .wasm32;
     if (ip.isFunctionType(ip.getNav(nav_index).typeOf(ip))) {
         assert(reloc_info.addend == 0); // addend not allowed for function relocations
@@ -786,7 +786,7 @@ pub fn getUavVAddr(
         .file = .zig_object,
         .index = @enumFromInt(reloc_info.parent.atom_index),
     }).?;
-    const parent_atom = wasm.atomPtr(parent_atom_index);
+    const parent_atom = parent_atom_index.ptr(wasm);
     const is_wasm32 = target.cpu.arch == .wasm32;
     const zcu = wasm.base.comp.zcu.?;
     const ty = Type.fromInterned(zcu.intern_pool.typeOf(uav));
@@ -912,7 +912,7 @@ pub fn freeNav(zig_object: *ZigObject, wasm: *Wasm, nav_index: InternPool.Nav.In
     const ip = &zcu.intern_pool;
     const nav_info = zig_object.navs.getPtr(nav_index).?;
     const atom_index = nav_info.atom;
-    const atom = wasm.atomPtr(atom_index);
+    const atom = atom_index.ptr(wasm);
     zig_object.symbols_free_list.append(gpa, atom.sym_index) catch {};
     for (nav_info.exports.items) |exp_sym_index| {
         const exp_sym = zig_object.symbol(exp_sym_index);
@@ -967,7 +967,7 @@ fn setupErrorsLen(zig_object: *ZigObject, wasm: *Wasm) !void {
     // overwrite existing atom if it already exists (maybe the error set has increased)
     // if not, allocate a new atom.
     const atom_index = if (wasm.symbol_atom.get(.{ .file = .zig_object, .index = sym_index })) |index| blk: {
-        const atom = wasm.atomPtr(index);
+        const atom = index.ptr(wasm);
         atom.prev = .none;
         atom.deinit(gpa);
         break :blk index;
@@ -984,7 +984,7 @@ fn setupErrorsLen(zig_object: *ZigObject, wasm: *Wasm) !void {
         break :idx try wasm.createAtom(sym_index, .zig_object);
     };
 
-    const atom = wasm.atomPtr(atom_index);
+    const atom = atom_index.ptr(wasm);
     atom.code.clearRetainingCapacity();
     atom.sym_index = sym_index;
     atom.size = 2;
@@ -1021,7 +1021,7 @@ pub fn createDebugSectionForIndex(zig_object: *ZigObject, wasm: *Wasm, index: *?
 
     const sym_index = try zig_object.allocateSymbol(gpa);
     const atom_index = try wasm.createAtom(sym_index, .zig_object);
-    const atom = wasm.atomPtr(atom_index);
+    const atom = atom_index.ptr(wasm);
     zig_object.symbols.items[sym_index] = .{
         .flags = .{
             .tag = .section,
@@ -1045,36 +1045,6 @@ pub fn updateDeclLineNumber(
         log.debug("updateDeclLineNumber {}{*}", .{ decl.fqn.fmt(&pt.zcu.intern_pool), decl });
         try dw.updateDeclLineNumber(pt.zcu, decl_index);
     }
-}
-
-/// Allocates debug atoms into their respective debug sections
-/// to merge them with maybe-existing debug atoms from object files.
-fn allocateDebugAtoms(zig_object: *ZigObject) !void {
-    if (zig_object.dwarf == null) return;
-
-    const allocAtom = struct {
-        fn f(ctx: *ZigObject, maybe_index: *?u32, atom_index: Atom.Index) !void {
-            const index = maybe_index.* orelse idx: {
-                const index = @as(u32, @intCast(ctx.segments.items.len));
-                try ctx.appendDummySegment();
-                maybe_index.* = index;
-                break :idx index;
-            };
-            const atom = ctx.atomPtr(atom_index);
-            atom.size = @as(u32, @intCast(atom.code.items.len));
-            ctx.symbols.items[atom.sym_index].index = index;
-            try ctx.appendAtomAtIndex(index, atom_index);
-        }
-    }.f;
-
-    try allocAtom(zig_object, &zig_object.debug_info_index, zig_object.debug_info_atom.?);
-    try allocAtom(zig_object, &zig_object.debug_line_index, zig_object.debug_line_atom.?);
-    try allocAtom(zig_object, &zig_object.debug_loc_index, zig_object.debug_loc_atom.?);
-    try allocAtom(zig_object, &zig_object.debug_str_index, zig_object.debug_str_atom.?);
-    try allocAtom(zig_object, &zig_object.debug_ranges_index, zig_object.debug_ranges_atom.?);
-    try allocAtom(zig_object, &zig_object.debug_abbrev_index, zig_object.debug_abbrev_atom.?);
-    try allocAtom(zig_object, &zig_object.debug_pubnames_index, zig_object.debug_pubnames_atom.?);
-    try allocAtom(zig_object, &zig_object.debug_pubtypes_index, zig_object.debug_pubtypes_atom.?);
 }
 
 /// For the given `decl_index`, stores the corresponding type representing the function signature.
@@ -1149,7 +1119,7 @@ pub fn createFunction(
     sym.index = try zig_object.appendFunction(gpa, .{ .type_index = type_index });
 
     const atom_index = try wasm.createAtom(sym_index, .zig_object);
-    const atom = wasm.atomPtr(atom_index);
+    const atom = atom_index.ptr(wasm);
     atom.size = @intCast(function_body.items.len);
     atom.code = function_body.moveToUnmanaged();
     atom.relocs = relocations.moveToUnmanaged();

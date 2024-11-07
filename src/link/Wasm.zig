@@ -1031,10 +1031,6 @@ pub fn createAtom(wasm: *Wasm, sym_index: Symbol.Index, object_index: OptionalOb
     return index;
 }
 
-pub fn atomPtr(wasm: *const Wasm, index: Atom.Index) *Atom {
-    return &wasm.atoms.items[@intFromEnum(index)];
-}
-
 fn parseArchive(wasm: *Wasm, obj: link.Input.Object) !void {
     const gpa = wasm.base.comp.gpa;
 
@@ -1988,7 +1984,7 @@ pub fn appendAtomAtIndex(wasm: *Wasm, index: Segment.Index, atom_index: Atom.Ind
     const gpa = wasm.base.comp.gpa;
     try wasm.atoms.ensureUnusedCapacity(gpa, 1);
     const gop = try wasm.segment_atom.getOrPut(gpa, index);
-    if (gop.found_existing) atomPtr(wasm, atom_index).prev = gop.value_ptr.*;
+    if (gop.found_existing) atom_index.ptr(wasm).prev = gop.value_ptr.*;
     gop.value_ptr.* = atom_index;
 }
 
@@ -2003,7 +1999,7 @@ fn allocateAtoms(wasm: *Wasm) !void {
         }
         var offset: u32 = 0;
         while (true) {
-            const atom = wasm.atomPtr(atom_index);
+            const atom = atom_index.ptr(wasm);
             const symbol_loc = atom.symbolLoc();
             // Ensure we get the original symbol, so we verify the correct symbol on whether
             // it is dead or not and ensure an atom is removed when dead.
@@ -2221,7 +2217,7 @@ fn createSyntheticFunction(
 
     // Create the Atom to output into the final binary.
     const atom_index = try wasm.createAtom(loc.index, .none);
-    const atom = wasm.atomPtr(atom_index);
+    const atom = atom_index.ptr(wasm);
     atom.code = try addRelocatableDataPayload(wasm, function_body);
     try wasm.appendAtomAtIndex(wasm.code_section_index.unwrap().?, atom_index);
 }
@@ -3186,7 +3182,7 @@ fn writeToFile(
         while (func_it.next()) |entry| {
             const sym_loc: SymbolLoc = .{ .index = entry.value_ptr.sym_index, .file = entry.key_ptr.file };
             const atom_index = wasm.symbol_atom.get(sym_loc).?;
-            const atom = wasm.atomPtr(atom_index);
+            const atom = atom_index.ptr(wasm);
 
             if (!is_obj) {
                 resolveAtomRelocs(wasm, atom);
@@ -3237,7 +3233,7 @@ fn writeToFile(
             // fill in the offset table and the data segments
             var current_offset: u32 = 0;
             while (true) {
-                const atom = wasm.atomPtr(atom_index);
+                const atom = atom_index.ptr(wasm);
                 if (!is_obj) {
                     resolveAtomRelocs(wasm, atom);
                 }
@@ -3331,12 +3327,12 @@ fn writeToFile(
 
         inline for (@typeInfo(CustomSections).@"struct".fields) |field| {
             if (@field(wasm.custom_sections, field.name).index.unwrap()) |index| {
-                var atom = wasm.atomPtr(wasm.atoms.get(index).?);
+                var atom = wasm.atoms.get(index).?.ptr(wasm);
                 while (true) {
                     resolveAtomRelocs(wasm, atom);
                     try debug_bytes.appendSlice(atom.code.slice(wasm));
                     if (atom.prev == .none) break;
-                    atom = wasm.atomPtr(atom.prev);
+                    atom = atom.prev.ptr(wasm);
                 }
                 if (debug_bytes.items.len > 0)
                     try emitDebugSection(gpa, &binary_bytes, debug_bytes.items, field.name);
@@ -4254,7 +4250,7 @@ fn emitCodeRelocations(
     const reloc_start = binary_bytes.items.len;
 
     var count: u32 = 0;
-    var atom: *Atom = wasm.atomPtr(wasm.atoms.get(code_index).?);
+    var atom: *Atom = wasm.atoms.get(code_index).?.ptr(wasm);
     // for each atom, we calculate the uleb size and append that
     var size_offset: u32 = 5; // account for code section size leb128
     while (true) {
@@ -4273,7 +4269,7 @@ fn emitCodeRelocations(
             log.debug("Emit relocation: {}", .{relocation});
         }
         if (atom.prev == .none) break;
-        atom = wasm.atomPtr(atom.prev);
+        atom = atom.prev.ptr(wasm);
     }
     if (count == 0) return;
     var buf: [5]u8 = undefined;
@@ -4305,7 +4301,7 @@ fn emitDataRelocations(
     // for each atom, we calculate the uleb size and append that
     var size_offset: u32 = 5; // account for code section size leb128
     for (wasm.data_segments.values()) |segment_index| {
-        var atom: *Atom = wasm.atomPtr(wasm.atoms.get(segment_index).?);
+        var atom: *Atom = wasm.atoms.get(segment_index).?.ptr(wasm);
         while (true) {
             size_offset += getUleb128Size(atom.code.len);
             for (atom.relocs.items) |relocation| {
@@ -4322,7 +4318,7 @@ fn emitDataRelocations(
                 log.debug("Emit relocation: {}", .{relocation});
             }
             if (atom.prev == .none) break;
-            atom = wasm.atomPtr(atom.prev);
+            atom = atom.prev.ptr(wasm);
         }
     }
     if (count == 0) return;
@@ -4474,6 +4470,10 @@ pub const Atom = struct {
             const result: OptionalIndex = @enumFromInt(@intFromEnum(i));
             assert(result != .none);
             return result;
+        }
+
+        pub fn ptr(index: Atom.Index, wasm: *const Wasm) *Atom {
+            return &wasm.atoms.items[@intFromEnum(index)];
         }
     };
 
@@ -4967,7 +4967,7 @@ fn parseSymbolIntoAtom(wasm: *Wasm, object_id: ObjectId, symbol_index: Symbol.In
     const atom_index = try wasm.createAtom(symbol_index, object_id.toOptional());
     try wasm.appendAtomAtIndex(final_index, atom_index);
 
-    const atom = wasm.atomPtr(atom_index);
+    const atom = atom_index.ptr(wasm);
     atom.alignment = alignment;
     atom.code = payload;
     atom.original_offset = offset;
