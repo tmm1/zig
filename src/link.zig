@@ -926,6 +926,7 @@ pub const File = struct {
         addend: u32,
 
         pub const Parent = union(enum) {
+            none,
             atom_index: u32,
             debug_output: DebugInfoOutput,
         };
@@ -1088,6 +1089,26 @@ pub const File = struct {
             inline .elf, .wasm => |tag| {
                 dev.check(tag.devFeature());
                 return @as(*tag.Type(), @fieldParentPtr("base", base)).loadInput(input);
+            },
+            else => {},
+        }
+    }
+
+    /// Called when all linker inputs have been sent via `loadInput`. After
+    /// this, `loadInput` will not be called anymore.
+    pub fn prelink(base: *File) anyerror!void {
+        const use_lld = build_options.have_llvm and base.comp.config.use_lld;
+        if (use_lld) return;
+
+        // In this case, an object file is created by the LLVM backend, so
+        // there is no prelink phase. The Zig code is linked as a standard
+        // object along with the others.
+        if (base.zcu_object_sub_path != null) return;
+
+        switch (base.tag) {
+            inline .wasm => |tag| {
+                dev.check(tag.devFeature());
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).prelink();
             },
             else => {},
         }

@@ -95,9 +95,10 @@ fn parse(
     func_types.clearRetainingCapacity();
 
     var start_function: Wasm.OptionalObjectFunctionIndex = .none;
-    var features: ?Wasm.Feature.Set = null;
+    var opt_features: ?Wasm.Feature.Set = null;
     var saw_linking_section = false;
     var saw_type_section = false;
+    var has_tls = false;
     var local_section_index: u32 = 0;
     while (pos < bytes.len) : (local_section_index += 1) {
         const section_index: Wasm.SectionIndex = @enumFromInt(local_section_index_base + local_section_index);
@@ -129,15 +130,17 @@ fn parse(
                                     const name, pos = readBytes(bytes, pos);
                                     const alignment, pos = readLeb(u32, bytes, pos);
                                     const flags, pos = readLeb(u32, bytes, pos);
+                                    const tls = ((flags & 2) != 0) or
+                                        // Supports legacy object files that specified
+                                        // being TLS by the name instead of the TLS flag.
+                                        std.mem.startsWith(u8, name, ".tdata") or
+                                        std.mem.startsWith(u8, name, ".tbss");
+                                    has_tls = has_tls or tls;
                                     segment.* = .{
                                         .name = try wasm.internString(name),
                                         .flags = .{
                                             .strings = (flags & 1) != 0,
-                                            .tls = ((flags & 2) != 0) or
-                                                // Supports legacy object files that specified
-                                                // being TLS by the name instead of the TLS flag.
-                                                std.mem.startsWith(u8, name, ".tdata") or
-                                                std.mem.startsWith(u8, name, ".tbss"),
+                                            .tls = tls,
                                             .alignment = @enumFromInt(alignment),
                                         },
                                     };
@@ -372,7 +375,7 @@ fn parse(
                         .len = count,
                     });
                 } else if (std.mem.eql(u8, section_name, "target_features")) {
-                    features, pos = try parseFeatures(wasm, bytes, pos, path);
+                    opt_features, pos = try parseFeatures(wasm, bytes, pos, path);
                 } else if (std.mem.startsWith(u8, section_name, ".debug")) {
                     const debug_content = bytes[pos..section_end];
                     pos = section_end;
@@ -577,12 +580,23 @@ fn parse(
 
     wasm.object_total_sections = local_section_index_base + local_section_index;
 
+    if (has_tls) {
+        const cpu_features = wasm.base.comp.root_mod.resolved_target.result.cpu.features;
+        if (!std.Target.wasm.featureSetHas(cpu_features, .atomics))
+            return diags.failParse(path, "object has TLS segment but target CPU feature atomics is disabled", .{});
+        if (!std.Target.wasm.featureSetHas(cpu_features, .bulk_memory))
+            return diags.failParse(path, "object has TLS segment but target CPU feature bulk_memory is disabled", .{});
+    }
+
+    const features = opt_features orelse return error.MissingFeatures;
+    if (true) @panic("iterate features, match against target features");
+
     return .{
         .version = version,
         .path = path,
         .archive_member_name = archive_member_name,
         .start_function = start_function,
-        .features = features orelse return error.MissingFeatures,
+        .features = features,
         .imports = .{
             .off = imports_start,
             .len = @intCast(wasm.object_imports.items.len - imports_start),

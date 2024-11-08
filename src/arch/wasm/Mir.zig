@@ -7,6 +7,7 @@
 //! and known jump labels for blocks.
 
 const Mir = @This();
+const InternPool = @import("../../InternPool.zig");
 
 const std = @import("std");
 
@@ -87,6 +88,11 @@ pub const Inst = struct {
         ///
         /// Uses `label`
         call_indirect = 0x11,
+        /// Calls a function by its index.
+        ///
+        /// The function is the auto-generated tag name function for the type
+        /// provided in `ip_index`.
+        call_tag_name,
         /// Contains a symbol to a function pointer
         /// uses `label`
         ///
@@ -580,6 +586,7 @@ pub const Inst = struct {
         ///
         /// Used by e.g. `br_table`
         payload: u32,
+        ip_index: InternPool.Index,
     };
 };
 

@@ -3,12 +3,13 @@
 
 const Emit = @This();
 const std = @import("std");
+const leb128 = std.leb;
+
 const Mir = @import("Mir.zig");
 const link = @import("../../link.zig");
 const Zcu = @import("../../Zcu.zig");
 const InternPool = @import("../../InternPool.zig");
 const codegen = @import("../../codegen.zig");
-const leb128 = std.leb;
 
 /// Contains our list of instructions
 mir: Mir,
@@ -254,7 +255,8 @@ fn offset(self: Emit) u32 {
 fn fail(emit: *Emit, comptime format: []const u8, args: anytype) InnerError {
     @branchHint(.cold);
     std.debug.assert(emit.error_msg == null);
-    const comp = emit.bin_file.base.comp;
+    const wasm = emit.bin_file;
+    const comp = wasm.base.comp;
     const zcu = comp.zcu.?;
     const gpa = comp.gpa;
     emit.error_msg = try Zcu.ErrorMsg.create(gpa, zcu.navSrcLoc(emit.owner_nav), format, args);
@@ -311,9 +313,9 @@ fn emitGlobal(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) !void {
     const global_offset = emit.offset();
     try emit.code.appendSlice(&buf);
 
-    const atom_index = wasm.zig_object.?.navs.get(emit.owner_nav).?.atom;
-    const atom = atom_index.ptr(wasm);
-    try atom.relocs.append(gpa, .{
+    const zo = wasm.zig_object.?;
+    try zo.relocs.append(gpa, .{
+        .nav_index = emit.nav_index,
         .index = label,
         .offset = global_offset,
         .tag = .GLOBAL_INDEX_LEB,
@@ -371,9 +373,8 @@ fn emitCall(emit: *Emit, inst: Mir.Inst.Index) !void {
     leb128.writeUnsignedFixed(5, &buf, label);
     try emit.code.appendSlice(&buf);
 
-    const atom_index = wasm.zig_object.?.navs.get(emit.owner_nav).?.atom;
-    const atom = atom_index.ptr(wasm);
-    try atom.relocs.append(gpa, .{
+    const zo = wasm.zig_object.?;
+    try zo.relocs.append(gpa, .{
         .offset = call_offset,
         .index = label,
         .tag = .FUNCTION_INDEX_LEB,
@@ -390,15 +391,14 @@ fn emitCallIndirect(emit: *Emit, inst: Mir.Inst.Index) !void {
     var buf: [5]u8 = undefined;
     leb128.writeUnsignedFixed(5, &buf, type_index);
     try emit.code.appendSlice(&buf);
-    if (type_index != 0) {
-        const atom_index = wasm.zig_object.?.navs.get(emit.owner_nav).?.atom;
-        const atom = atom_index.ptr(wasm);
-        try atom.relocs.append(wasm.base.comp.gpa, .{
-            .offset = call_offset,
-            .index = type_index,
-            .tag = .TYPE_INDEX_LEB,
-        });
-    }
+
+    const zo = wasm.zig_object.?;
+    try zo.relocs.append(wasm.base.comp.gpa, .{
+        .offset = call_offset,
+        .index = type_index,
+        .tag = .TYPE_INDEX_LEB,
+    });
+
     try leb128.writeUleb128(emit.code.writer(), @as(u32, 0)); // TODO: Emit relocation for table index
 }
 
@@ -413,15 +413,12 @@ fn emitFunctionIndex(emit: *Emit, inst: Mir.Inst.Index) !void {
     leb128.writeUnsignedFixed(5, &buf, symbol_index);
     try emit.code.appendSlice(&buf);
 
-    if (symbol_index != 0) {
-        const atom_index = wasm.zig_object.?.navs.get(emit.owner_nav).?.atom;
-        const atom = atom_index.ptr(wasm);
-        try atom.relocs.append(gpa, .{
-            .offset = index_offset,
-            .index = symbol_index,
-            .tag = .TABLE_INDEX_SLEB,
-        });
-    }
+    const zo = wasm.zig_object.?;
+    try zo.relocs.append(gpa, .{
+        .offset = index_offset,
+        .index = symbol_index,
+        .tag = .TABLE_INDEX_SLEB,
+    });
 }
 
 fn emitMemAddress(emit: *Emit, inst: Mir.Inst.Index) !void {
@@ -445,16 +442,13 @@ fn emitMemAddress(emit: *Emit, inst: Mir.Inst.Index) !void {
         try emit.code.appendSlice(&buf);
     }
 
-    if (mem.pointer != 0) {
-        const atom_index = wasm.zig_object.?.navs.get(emit.owner_nav).?.atom;
-        const atom = atom_index.ptr(wasm);
-        try atom.relocs.append(gpa, .{
-            .offset = mem_offset,
-            .index = mem.pointer,
-            .tag = if (is_wasm32) .MEMORY_ADDR_LEB else .MEMORY_ADDR_LEB64,
-            .addend = @as(i32, @intCast(mem.offset)),
-        });
-    }
+    const zo = wasm.zig_object.?;
+    try zo.relocs.append(gpa, .{
+        .offset = mem_offset,
+        .index = mem.pointer,
+        .tag = if (is_wasm32) .MEMORY_ADDR_LEB else .MEMORY_ADDR_LEB64,
+        .addend = @as(i32, @intCast(mem.offset)),
+    });
 }
 
 fn emitExtended(emit: *Emit, inst: Mir.Inst.Index) !void {
