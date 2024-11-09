@@ -102,10 +102,6 @@ pub fn updateExports(
     return self.llvm_object.updateExports(pt, exported, export_indices);
 }
 
-pub fn freeDecl(self: *NvPtx, decl_index: InternPool.DeclIndex) void {
-    return self.llvm_object.freeDecl(decl_index);
-}
-
 pub fn flush(self: *NvPtx, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Progress.Node) link.File.FlushError!void {
     return self.flushModule(arena, tid, prog_node);
 }

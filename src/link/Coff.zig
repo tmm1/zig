@@ -1447,7 +1447,6 @@ pub fn freeNav(coff: *Coff, nav_index: InternPool.NavIndex) void {
     if (coff.llvm_object) |llvm_object| return llvm_object.freeNav(nav_index);
 
     const gpa = coff.base.comp.gpa;
-    log.debug("freeDecl 0x{x}", .{nav_index});
 
     if (coff.decls.fetchOrderedRemove(nav_index)) |const_kv| {
         var kv = const_kv;

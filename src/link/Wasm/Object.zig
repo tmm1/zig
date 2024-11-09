@@ -2,7 +2,6 @@ const Object = @This();
 
 const Wasm = @import("../Wasm.zig");
 const Alignment = Wasm.Alignment;
-const Symbol = @import("Symbol.zig");
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -27,32 +26,128 @@ start_function: Wasm.OptionalObjectFunctionIndex,
 /// (or therefore missing) and must generate an error when another object uses
 /// features that are not supported by the other.
 features: Wasm.Feature.Set,
-/// Points into Wasm object_function_imports
-function_imports: RelativeSlice,
+/// Points into Wasm functions
+functions: RelativeSlice,
 /// Points into Wasm object_globals_imports
 globals_imports: RelativeSlice,
 /// Points into Wasm object_tables_imports
 tables_imports: RelativeSlice,
 /// Points into Wasm object_relocatable_datas
 relocatable_data: RelativeSlice,
-/// Points into Wasm object_relocatable_codes
-relocatable_code: RelativeSlice,
 /// Points into Wasm object_relocatable_customs
 relocatable_custom: RelativeSlice,
 /// For calculating local section index from `Wasm.SectionIndex`.
 local_section_index_base: u32,
-/// Points into Wasm object_named_segments
-named_segments: RelativeSlice,
 /// Points into Wasm object_init_funcs
 init_funcs: RelativeSlice,
 /// Points into Wasm object_comdats
 comdats: RelativeSlice,
-/// Points into Wasm object_symbols
-symbols: RelativeSlice,
 
 pub const RelativeSlice = struct {
     off: u32,
     len: u32,
+};
+
+pub const SegmentInfo = struct {
+    name: Wasm.String,
+    flags: Flags,
+
+    const Flags = packed struct(u32) {
+        /// Signals that the segment contains only null terminated strings allowing
+        /// the linker to perform merging.
+        strings: bool,
+        /// The segment contains thread-local data. This means that a unique copy
+        /// of this segment will be created for each thread.
+        tls: bool,
+        /// If the object file is included in the final link, the segment should be
+        /// retained in the final output regardless of whether it is used by the
+        /// program.
+        retain: bool,
+        alignment: Alignment,
+
+        _: u23 = 0,
+    };
+};
+
+pub const FunctionImport = struct {
+    module_name: Wasm.String,
+    name: Wasm.String,
+    function_index: ScratchSpace.FuncTypeIndex,
+};
+
+pub const Symbol = struct {
+    flags: Wasm.SymbolFlags,
+    name: Wasm.OptionalString,
+    pointee: Pointee,
+
+    /// https://github.com/WebAssembly/tool-conventions/blob/df8d737539eb8a8f446ba5eab9dc670c40dfb81e/Linking.md#symbol-table-subsection
+    const Tag = enum(u8) {
+        function,
+        data,
+        global,
+        section,
+        event,
+        table,
+    };
+
+    const Pointee = union(enum) {
+        function: Wasm.ObjectFunctionIndex,
+        function_import: ScratchSpace.FuncImportIndex,
+        data: struct {
+            segment_index: Wasm.ObjectSegmentIndex,
+            segment_offset: u32,
+            size: u32,
+        },
+        data_import: void,
+        global: Wasm.ObjectGlobalIndex,
+        global_import: Wasm.ObjectGlobalImportIndex,
+        section: Wasm.SectionIndex,
+        table: Wasm.ObjectTableIndex,
+        table_import: Wasm.ObjectTableImportIndex,
+    };
+};
+
+pub const ScratchSpace = struct {
+    func_types: std.ArrayListUnmanaged(Wasm.FunctionType.Index) = .empty,
+    func_type_indexes: std.ArrayListUnmanaged(FuncTypeIndex) = .empty,
+    func_imports: std.ArrayListUnmanaged(FunctionImport) = .empty,
+    symbol_table: std.ArrayListUnmanaged(Symbol) = .empty,
+    segment_info: std.ArrayListUnmanaged(SegmentInfo) = .empty,
+
+    /// Index into `func_imports`.
+    const FuncImportIndex = enum(u32) {
+        _,
+
+        fn ptr(index: FunctionImport, ss: *const ScratchSpace) *FunctionImport {
+            return &ss.func_imports.items[@intFromEnum(index)];
+        }
+    };
+
+    /// Index into `func_types`.
+    const FuncTypeIndex = enum(u32) {
+        _,
+
+        fn ptr(index: FuncTypeIndex, ss: *const ScratchSpace) *Wasm.FunctionType.Index {
+            return &ss.func_types.items[@intFromEnum(index)];
+        }
+    };
+
+    pub fn deinit(ss: *ScratchSpace, gpa: Allocator) void {
+        ss.func_types.deinit(gpa);
+        ss.func_type_indexes.deinit(gpa);
+        ss.func_imports.deinit(gpa);
+        ss.symbol_table.deinit(gpa);
+        ss.segment_info.deinit(gpa);
+        ss.* = undefined;
+    }
+
+    fn clear(ss: *ScratchSpace) void {
+        ss.func_types.clearRetainingCapacity();
+        ss.func_type_indexes.clearRetainingCapacity();
+        ss.func_imports.clearRetainingCapacity();
+        ss.symbol_table.clearRetainingCapacity();
+        ss.segment_info.clearRetainingCapacity();
+    }
 };
 
 fn parse(
@@ -60,9 +155,9 @@ fn parse(
     bytes: []const u8,
     path: Path,
     archive_member_name: ?[]const u8,
-    /// Temporary scratch space used to look up function type indexes while
-    /// parsing and remap them.
-    func_types: *std.ArrayListUnmanaged(Wasm.FunctionType.Index),
+    host_name: Wasm.String,
+    ss: *ScratchSpace,
+    must_link: bool,
 ) anyerror!Object {
     const gpa = wasm.base.comp.gpa;
     const diags = &wasm.base.comp.link_diags;
@@ -76,30 +171,27 @@ fn parse(
     pos += 4;
 
     const relocatable_data_start: u32 = @intCast(wasm.object_relocatable_datas.items.len);
-    const relocatable_code_start: u32 = @intCast(wasm.object_relocatable_codes.items.len);
     const relocatable_custom_start: u32 = @intCast(wasm.object_relocatable_customs.items.len);
     const imports_start: u32 = @intCast(wasm.object_imports.items.len);
     const functions_start: u32 = @intCast(wasm.object_functions.items.len);
     const tables_start: u32 = @intCast(wasm.object_tables.items.len);
     const memories_start: u32 = @intCast(wasm.object_memories.items.len);
     const globals_start: u32 = @intCast(wasm.object_globals.items.len);
-    const named_segments_start: u32 = @intCast(wasm.object_named_segments.items.len);
     const init_funcs_start: u32 = @intCast(wasm.object_init_funcs.items.len);
     const comdats_start: u32 = @intCast(wasm.object_comdats.items.len);
-    const symbols_start: u32 = @intCast(wasm.object_symbols.items.len);
-    const function_imports_start: u32 = @intCast(wasm.object_function_imports.items.len);
     const global_imports_start: u32 = @intCast(wasm.object_global_imports.items.len);
     const table_imports_start: u32 = @intCast(wasm.object_table_imports.items.len);
     const local_section_index_base = wasm.object_total_sections;
+    const source_location: Wasm.SourceLocation = .fromObjectIndex(wasm.objects.items.len);
 
-    func_types.clearRetainingCapacity();
+    ss.clear();
 
     var start_function: Wasm.OptionalObjectFunctionIndex = .none;
     var opt_features: ?Wasm.Feature.Set = null;
     var saw_linking_section = false;
-    var saw_type_section = false;
     var has_tls = false;
     var local_section_index: u32 = 0;
+    var table_count: usize = 0;
     while (pos < bytes.len) : (local_section_index += 1) {
         const section_index: Wasm.SectionIndex = @enumFromInt(local_section_index_base + local_section_index);
 
@@ -114,7 +206,7 @@ fn parse(
                 if (std.mem.eql(u8, section_name, "linking")) {
                     saw_linking_section = true;
                     const section_version, pos = readLeb(u32, bytes, pos);
-                    log.debug("Link meta data version: {d}", .{section_version});
+                    log.debug("link meta data version: {d}", .{section_version});
                     if (section_version != 2) return error.UnsupportedVersion;
                     while (pos < section_end) {
                         const sub_type, pos = readLeb(u8, bytes, pos);
@@ -126,11 +218,12 @@ fn parse(
 
                         switch (@as(Wasm.SubsectionType, @enumFromInt(sub_type))) {
                             .segment_info => {
-                                for (try wasm.object_named_segments.addManyAsSlice(gpa, count)) |*segment| {
+                                for (try ss.segment_info.addManyAsSlice(gpa, count)) |*segment| {
                                     const name, pos = readBytes(bytes, pos);
                                     const alignment, pos = readLeb(u32, bytes, pos);
-                                    const flags, pos = readLeb(u32, bytes, pos);
-                                    const tls = ((flags & 2) != 0) or
+                                    const flags_u32, pos = readLeb(u32, bytes, pos);
+                                    const flags: SegmentInfo.Flags = @bitCast(flags_u32);
+                                    const tls = flags.tls or
                                         // Supports legacy object files that specified
                                         // being TLS by the name instead of the TLS flag.
                                         std.mem.startsWith(u8, name, ".tdata") or
@@ -139,25 +232,34 @@ fn parse(
                                     segment.* = .{
                                         .name = try wasm.internString(name),
                                         .flags = .{
-                                            .strings = (flags & 1) != 0,
+                                            .strings = flags.strings,
                                             .tls = tls,
                                             .alignment = @enumFromInt(alignment),
+                                            .no_strip = flags.retain,
                                         },
                                     };
-                                    log.debug("found segment: {s} align({d}) flags({b})", .{
-                                        name, segment.alignment, segment.flags,
-                                    });
                                 }
                             },
                             .init_funcs => {
                                 for (try wasm.object_init_funcs.addManyAsSlice(gpa, count)) |*func| {
                                     const priority, pos = readLeb(u32, bytes, pos);
                                     const symbol_index, pos = readLeb(u32, bytes, pos);
+                                    if (symbol_index > ss.symbol_table.items.len)
+                                        return diags.failParse(path, "init_funcs before symbol table", .{});
+                                    const sym = &ss.symbol_table.items[symbol_index];
+                                    if (sym.tag != .function) {
+                                        return diags.failParse(path, "init_func symbol '{s}' not a function", .{
+                                            wasm.stringSlice(sym.name),
+                                        });
+                                    } else if (sym.flags.undefined) {
+                                        return diags.failParse(path, "init_func symbol '{s}' is an import", .{
+                                            wasm.stringSlice(sym.name),
+                                        });
+                                    }
                                     func.* = .{
                                         .priority = priority,
-                                        .symbol_index = symbol_index,
+                                        .function_index = sym.pointee.function,
                                     };
-                                    log.debug("found init_funcs - prio: {d}, index: {d}", .{ func.priority, func.symbol_index });
                                 }
                             },
                             .comdat_info => {
@@ -187,24 +289,20 @@ fn parse(
                                 }
                             },
                             .symbol_table => {
-                                var table_count: usize = 0;
-                                for (try wasm.object_symbols.addManyAsSlice(gpa, count)) |*symbol| {
+                                for (try ss.symbol_table.addManyAsSlice(gpa, count)) |*symbol| {
                                     const tag, pos = readEnum(Symbol.Tag, bytes, pos);
                                     const flags, pos = readLeb(u32, bytes, pos);
                                     symbol.* = .{
                                         .flags = @bitCast(flags),
-                                        .name = undefined,
+                                        .name = .none,
                                         .pointee = undefined,
-                                        .virtual_address = undefined,
                                     };
-                                    // Initialize zig-specific flags.
-                                    symbol.flags.alive = false;
-                                    symbol.tag = tag;
+                                    symbol.flags.clearZigSpecific(must_link);
 
                                     switch (tag) {
                                         .data => {
                                             const name, pos = readBytes(bytes, pos);
-                                            symbol.name = try wasm.internString(name);
+                                            symbol.name = (try wasm.internString(name)).toOptional();
                                             if (symbol.flags.undefined) {
                                                 symbol.pointee = .data_import;
                                             } else {
@@ -212,71 +310,60 @@ fn parse(
                                                 const segment_offset, pos = readLeb(u32, bytes, pos);
                                                 const size, pos = readLeb(u32, bytes, pos);
 
-                                                symbol.pointee = .{ .data_obj = @enumFromInt(named_segments_start + segment_index) };
-                                                _ = segment_offset;
-                                                _ = size;
+                                                symbol.pointee = .{ .data = .{
+                                                    .index = @enumFromInt(relocatable_data_start + segment_index),
+                                                    .segment_offset = segment_offset,
+                                                    .size = size,
+                                                } };
                                             }
                                         },
                                         .section => {
                                             const local_section, pos = readLeb(u32, bytes, pos);
                                             const section: Wasm.SectionIndex = @enumFromInt(local_section_index_base + local_section);
-                                            const rc = wasm.object_relocatable_customs.getPtr(section) orelse
-                                                return error.SectionNotFound;
-                                            symbol.name = rc.section_name;
                                             symbol.pointee = .{ .section = section };
-                                            rc.flags.represented = true;
                                         },
 
                                         .function => {
                                             const local_index, pos = readLeb(u32, bytes, pos);
                                             if (symbol.flags.undefined) {
-                                                const function_import: Wasm.ObjectFunctionImportIndex = @enumFromInt(function_imports_start + local_index);
-                                                symbol.pointee = .{ .function_import_obj = function_import };
+                                                symbol.pointee = .{ .function_import = @enumFromInt(local_index) };
                                                 if (flags.explicit_name) {
                                                     const name, pos = readBytes(bytes, pos);
-                                                    symbol.name = try wasm.internString(name);
-                                                } else {
-                                                    symbol.name = wasm.objectFunctionImportPtr(function_import).name;
+                                                    symbol.name = (try wasm.internString(name)).toOptional();
                                                 }
                                             } else {
-                                                symbol.pointee = .{ .function_obj = @enumFromInt(functions_start + local_index) };
+                                                symbol.pointee = .{ .function = @enumFromInt(functions_start + local_index) };
                                                 const name, pos = readBytes(bytes, pos);
-                                                symbol.name = try wasm.internString(name);
+                                                symbol.name = (try wasm.internString(name)).toOptional();
                                             }
                                         },
                                         .global => {
                                             const local_index, pos = readLeb(u32, bytes, pos);
                                             if (symbol.flags.undefined) {
-                                                const global_import: Wasm.ObjectGlobalImportIndex = @enumFromInt(global_imports_start + local_index);
-                                                symbol.pointee = .{ .global_import_obj = global_import };
+                                                symbol.pointee = .{ .global_import = @enumFromInt(global_imports_start + local_index) };
                                                 if (flags.explicit_name) {
                                                     const name, pos = readBytes(bytes, pos);
-                                                    symbol.name = try wasm.internString(name);
-                                                } else {
-                                                    symbol.name = wasm.objectGlobalImportPtr(global_import).name;
+                                                    symbol.name = (try wasm.internString(name)).toOptional();
                                                 }
                                             } else {
-                                                symbol.pointee = .{ .global_obj = @enumFromInt(globals_start + local_index) };
+                                                symbol.pointee = .{ .global = @enumFromInt(globals_start + local_index) };
                                                 const name, pos = readBytes(bytes, pos);
-                                                symbol.name = try wasm.internString(name);
+                                                symbol.name = (try wasm.internString(name)).toOptional();
                                             }
                                         },
                                         .table => {
                                             table_count += 1;
                                             const local_index, pos = readLeb(u32, bytes, pos);
                                             if (symbol.flags.undefined) {
-                                                const table_import: Wasm.ObjectTableImportIndex = @enumFromInt(table_imports_start + local_index);
-                                                symbol.pointee = .{ .table_import_obj = table_import };
+                                                symbol.pointee = .{ .table_import = @enumFromInt(table_imports_start + local_index) };
                                                 if (flags.explicit_name) {
                                                     const name, pos = readBytes(bytes, pos);
-                                                    symbol.name = try wasm.internString(name);
-                                                } else {
-                                                    symbol.name = wasm.objectTableImportPtr(table_import).name;
+                                                    symbol.name = (try wasm.internString(name)).toOptional();
                                                 }
                                             } else {
-                                                symbol.pointee = .{ .table_obj = @enumFromInt(tables_start + local_index) };
+                                                symbol.pointee = .{ .table = @enumFromInt(tables_start + local_index) };
                                                 const name, pos = readBytes(bytes, pos);
-                                                symbol.name = try wasm.internString(name);
+                                                symbol.name = (try wasm.internString(name)).toOptional();
                                             }
                                         },
                                         else => {
@@ -286,92 +373,81 @@ fn parse(
                                     }
                                     log.debug("found symbol: {}", .{symbol});
                                 }
-
-                                // Check for indirect function table in case of an MVP object file.
-                                legacy_indirect_function_table: {
-                                    const table_imports = wasm.object_table_imports.items[table_imports_start..];
-                                    // If there is a symbol for each import table, this is not a legacy object file.
-                                    if (table_imports.len == table_count) break :legacy_indirect_function_table;
-                                    if (table_count != 0) {
-                                        return diags.failParse(path, "expected a table entry symbol for each of the {d} table(s), but instead got {d} symbols.", .{
-                                            table_imports.len, table_count,
-                                        });
-                                    }
-                                    // MVP object files cannot have any table definitions, only
-                                    // imports (for the indirect function table).
-                                    const tables = wasm.object_tables.items[tables_start..];
-                                    if (tables.len > 0) {
-                                        return diags.failParse(path, "table definition without representing table symbols", .{});
-                                    }
-                                    if (table_imports.len != 1) {
-                                        return diags.failParse(path, "found more than one table import, but no representing table symbols", .{});
-                                    }
-                                    const table_import_name = table_imports[0].name;
-                                    if (table_import_name != wasm.preloaded_strings.__indirect_function_table) {
-                                        return diags.failParse(path, "non-indirect function table import '{s}' is missing a corresponding symbol", .{
-                                            wasm.stringSlice(table_import_name),
-                                        });
-                                    }
-                                    try wasm.object_symbols.append(gpa, .{
-                                        .flags = .{
-                                            .undefined = true,
-                                            .no_strip = true,
-                                            .tag = .table,
-                                        },
-                                        .name = table_import_name,
-                                        .pointee = .{ .table_import = @enumFromInt(table_imports_start) },
-                                        .virtual_address = undefined,
-                                    });
-                                    log.debug("created symbol for legacy indirect function table", .{});
-                                }
-
-                                // Not all debug sections may be represented by a symbol, for those sections
-                                // we manually create a symbol.
-                                const rc_section_indexes = wasm.object_relocatable_customs.keys()[relocatable_custom_start..];
-                                const rcs = wasm.object_relocatable_customs.values()[relocatable_custom_start..];
-                                for (rc_section_indexes, rcs) |rc_section_index, *rc| {
-                                    if (rc.represented) continue;
-                                    rc.represented = true;
-                                    try wasm.object_symbols.append(gpa, .{
-                                        .name = rc.section_name,
-                                        .flags = .{
-                                            .binding = .local,
-                                        },
-                                        .tag = .section,
-                                        .virtual_address = 0,
-                                        .index = rc_section_index,
-                                    });
-                                    log.debug("created synthetic custom section symbol for '{s}'", .{wasm.stringSlice(section_name)});
-                                }
                             },
                         }
                     }
-                } else if (std.mem.startsWith(u8, section_name, "reloc")) {
+                } else if (std.mem.startsWith(u8, section_name, "reloc.")) {
+                    // 'The "reloc." custom sections must come after the "linking" custom section'
+                    if (!saw_linking_section) return error.RelocBeforeLinkingSection;
+
+                    // "Relocation sections start with an identifier specifying
+                    // which section they apply to, and must be sequenced in
+                    // the module after that section."
+                    // "Relocation sections can only target code, data and custom sections."
                     const local_section, pos = readLeb(u32, bytes, pos);
                     const count, pos = readLeb(u32, bytes, pos);
                     const section: Wasm.SectionIndex = @enumFromInt(local_section_index_base + local_section);
 
-                    log.debug("found {d} relocations for local_section={d}, total_section={d}", .{
-                        count, local_section, section,
-                    });
+                    log.debug("found {d} relocations for section={d}", .{ count, section });
 
-                    for (try wasm.object_relocations.addManyAsSlice(gpa, count)) |*relocation| {
+                    var prev_offset: u32 = 0;
+                    try wasm.relocations.ensureUnusedCapacity(gpa, count);
+                    for (0..count) |_| {
                         const tag: Wasm.Relocation.Tag = @enumFromInt(bytes[pos]);
                         pos += 1;
                         const offset, pos = readLeb(u32, bytes, pos);
                         const index, pos = readLeb(u32, bytes, pos);
-                        const addend: i32, pos = if (tag.addendIsPresent()) readLeb(i32, bytes, pos) else .{ 0, pos };
-                        relocation.* = .{
-                            .tag = tag,
-                            .offset = offset,
-                            .index = index,
-                            .addend = addend,
-                        };
-                        log.debug("found relocation: {}", .{relocation});
+
+                        if (offset < prev_offset)
+                            return diags.failParse(path, "relocation entries not sorted by offset", .{});
+                        prev_offset = offset;
+
+                        switch (tag) {
+                            .MEMORY_ADDR_LEB,
+                            .MEMORY_ADDR_SLEB,
+                            .MEMORY_ADDR_I32,
+                            .MEMORY_ADDR_REL_SLEB,
+                            .MEMORY_ADDR_LEB64,
+                            .MEMORY_ADDR_SLEB64,
+                            .MEMORY_ADDR_I64,
+                            .MEMORY_ADDR_REL_SLEB64,
+                            .MEMORY_ADDR_TLS_SLEB,
+                            .MEMORY_ADDR_LOCREL_I32,
+                            .MEMORY_ADDR_TLS_SLEB64,
+                            .FUNCTION_OFFSET_I32,
+                            .SECTION_OFFSET_I32,
+                            => {
+                                const addend: i32, pos = readLeb(i32, bytes, pos);
+                                wasm.relocations.appendAssumeCapacity(.{
+                                    .tag = tag,
+                                    .offset = offset,
+                                    .pointee = .{ .section = ss.symbol_table.items[index].pointee.section },
+                                    .addend = addend,
+                                });
+                            },
+                            .TYPE_INDEX_LEB => {
+                                wasm.relocations.appendAssumeCapacity(.{
+                                    .tag = tag,
+                                    .offset = offset,
+                                    .pointee = .{ .type_index = ss.func_types.items[index] },
+                                    .addend = undefined,
+                                });
+                            },
+                            .FUNCTION_INDEX_LEB,
+                            .GLOBAL_INDEX_LEB,
+                            => {
+                                wasm.relocations.appendAssumeCapacity(.{
+                                    .tag = tag,
+                                    .offset = offset,
+                                    .pointee = .{ .symbol_name = ss.symbol_table.items[index].name.unwrap().? },
+                                    .addend = undefined,
+                                });
+                            },
+                        }
                     }
 
                     try wasm.object_relocations_table.putNoClobber(gpa, section, .{
-                        .off = @intCast(wasm.object_relocations.items.len - count),
+                        .off = @intCast(wasm.relocations.items.len - count),
                         .len = count,
                     });
                 } else if (std.mem.eql(u8, section_name, "target_features")) {
@@ -396,11 +472,8 @@ fn parse(
                 }
             },
             .type => {
-                if (saw_type_section) return error.DuplicateTypeSection;
-                saw_type_section = true;
                 const func_types_len, pos = readLeb(u32, bytes, pos);
-                try func_types.resize(gpa, func_types_len);
-                for (func_types.items) |*func_type| {
+                for (ss.func_types.addManyAsSlice(gpa, func_types_len)) |*func_type| {
                     if (bytes[pos] != std.wasm.function_type) return error.ExpectedFuncType;
                     pos += 1;
 
@@ -413,8 +486,6 @@ fn parse(
                 }
             },
             .import => {
-                if (!saw_type_section) return error.ImportSectionBeforeTypeSection;
-
                 const imports_len, pos = readLeb(u32, bytes, pos);
                 for (0..imports_len) |_| {
                     const module_name, pos = readBytes(bytes, pos);
@@ -425,10 +496,10 @@ fn parse(
                     switch (kind) {
                         .function => {
                             const function, pos = readLeb(u32, bytes, pos);
-                            try wasm.object_function_imports.append(gpa, .{
+                            try ss.function_imports.append(gpa, .{
                                 .module_name = interned_module_name,
                                 .name = interned_name,
-                                .index = func_types.items[function],
+                                .index = function,
                             });
                         },
                         .memory => {
@@ -470,12 +541,9 @@ fn parse(
                 }
             },
             .function => {
-                if (!saw_type_section) return error.FunctionSectionBeforeTypeSection;
-
                 const functions_len, pos = readLeb(u32, bytes, pos);
-                for (try wasm.object_functions.addManyAsSlice(gpa, functions_len)) |*func| {
-                    const func_type_index, pos = readLeb(u32, bytes, pos);
-                    func.* = func_types.items[func_type_index];
+                for (try ss.func_type_indexes.addManyAsSlice(gpa, functions_len)) |*func_type_index| {
+                    func_type_index.*, pos = readLeb(u32, bytes, pos);
                 }
             },
             .table => {
@@ -541,16 +609,19 @@ fn parse(
             .code => {
                 const start = pos;
                 const count, pos = readLeb(u32, bytes, pos);
-                for (try wasm.object_relocatable_codes.addManyAsSlice(gpa, count), 0..) |*elem, index| {
+                for (try wasm.object_functions.addManyAsSlice(gpa, count)) |*elem| {
                     const code_len, pos = readLeb(u32, bytes, pos);
                     const offset: u32 = @intCast(pos - start);
                     const payload = try wasm.addRelocatableDataPayload(bytes[pos..][0..code_len]);
                     pos += code_len;
                     elem.* = .{
-                        .payload = payload,
-                        .function_index = @enumFromInt(functions_start + index),
+                        .flags = .{}, // populated from symbol table
+                        .name = .none, // populated from symbol table
+                        .type_index = undefined, // populated from func_types
+                        .code = payload,
                         .offset = offset,
                         .section_index = section_index,
+                        .source_location = source_location,
                     };
                 }
             },
@@ -559,7 +630,7 @@ fn parse(
                 const count, pos = readLeb(u32, bytes, pos);
                 for (try wasm.object_relocatable_datas.addManyAsSlice(gpa, count)) |*elem| {
                     const memidx, pos = readLeb(u32, bytes, pos);
-                    _ = memidx;
+                    if (memidx != 0) return diags.failParse(path, "data section uses mem index {d}", .{memidx});
                     pos = skipInit(bytes, pos);
                     const data_len, pos = readLeb(u32, bytes, pos);
                     const offset: u32 = @intCast(pos - start);
@@ -569,6 +640,8 @@ fn parse(
                         .payload = payload,
                         .offset = offset,
                         .section_index = section_index,
+                        .name = .none, // Populated from symbol table
+                        .flags = .{}, // Populated from symbol table and segment_info
                     };
                 }
             },
@@ -591,6 +664,173 @@ fn parse(
     const features = opt_features orelse return error.MissingFeatures;
     if (true) @panic("iterate features, match against target features");
 
+    // Apply function type information.
+    for (ss.func_types.items, wasm.object_functions.items[functions_start..]) |func_type, *func| {
+        func.type_index = func_type;
+    }
+
+    // Apply symbol table information.
+    for (ss.symbol_table.items) |symbol| switch (symbol.pointee) {
+        .function_import => |index| {
+            const ptr = index.ptr(ss);
+            const name = symbol.name.unwrap().?;
+            if (symbol.flags.binding == .local) {
+                diags.addParseError(path, "local symbol '{s}' references import", .{name.slice(wasm)});
+                continue;
+            }
+            const gop = try wasm.object_function_imports.getOrPut(gpa, name);
+            const fn_ty_index = ptr.function_index.ptr(ss).*;
+            if (gop.found_existing) {
+                if (gop.value_ptr.type != fn_ty_index) {
+                    var err = try diags.addErrorWithNotes(2);
+                    try err.addMsg("symbol '{s}' mismatching function signatures", .{name.slice(wasm)});
+                    try err.addSrcNote(gop.value_ptr.source_location, "imported as {} here", .{gop.value_ptr.type.fmt(wasm)});
+                    try err.addSrcNote(source_location, "imported as {} here", .{fn_ty_index.fmt(wasm)});
+                    continue;
+                }
+                if (gop.value_ptr.module_name != ptr.module_name) {
+                    var err = try diags.addErrorWithNotes(2);
+                    try err.addMsg("symbol '{s}' mismatching module names", .{name.slice(wasm)});
+                    try err.addSrcNote(gop.value_ptr.source_location, "module '{s}' here", .{gop.value_ptr.module_name.slice(wasm)});
+                    try err.addSrcNote(source_location, "module '{s}' here", .{ptr.module_name.slice(wasm)});
+                    continue;
+                }
+                if (symbol.flags.binding == .strong) gop.value_ptr.flags.binding = .strong;
+                if (!symbol.flags.visibility_hidden) gop.value_ptr.flags.visibility_hidden = false;
+                if (symbol.flags.no_strip) gop.value_ptr.flags.no_strip = true;
+            } else {
+                gop.value_ptr.* = .{
+                    .flags = symbol.flags,
+                    .module_name = ptr.module_name,
+                    .source_location = source_location,
+                    .resolution = .unresolved,
+                    .type = fn_ty_index,
+                };
+            }
+        },
+        .function => |index| {
+            assert(!symbol.flags.undefined);
+            const ptr = index.ptr();
+            ptr.name = symbol.name;
+            ptr.flags = symbol.flags;
+            if (symbol.flags.binding == .local) continue; // No participation in symbol resolution.
+            const name = symbol.name.unwrap().?;
+            const gop = try wasm.object_function_imports.getOrPut(gpa, name);
+            if (gop.found_existing) {
+                if (gop.value_ptr.type != ptr.type_index) {
+                    var err = try diags.addErrorWithNotes(2);
+                    try err.addMsg("function signature mismatch: {s}", .{name.slice(wasm)});
+                    try err.addSrcNote(gop.value_ptr.source_location, "exported as {} here", .{ptr.type_index.fmt(wasm)});
+                    const word = if (gop.value_ptr.resolution == .none) "imported" else "exported";
+                    try err.addSrcNote(source_location, "{s} as {} here", .{ word, gop.value_ptr.type.fmt(wasm) });
+                    continue;
+                }
+                if (gop.value_ptr.resolution == .none or gop.value_ptr.flags.binding == .weak) {
+                    // Intentional: if they're both weak, take the last one.
+                    gop.value_ptr.source_location = source_location;
+                    gop.value_ptr.module_name = host_name;
+                    gop.value_ptr.resolution = .fromObjectFunction(index);
+                    continue;
+                }
+                var err = try diags.addErrorWithNotes(2);
+                try err.addMsg("symbol collision: {s}", .{name.slice(wasm)});
+                try err.addSrcNote(gop.value_ptr.source_location, "exported as {} here", .{ptr.type_index.fmt(wasm)});
+                try err.addSrcNote(source_location, "exported as {} here", .{gop.value_ptr.type.fmt(wasm)});
+                continue;
+            } else {
+                gop.value_ptr.* = .{
+                    .flags = symbol.flags,
+                    .module_name = host_name,
+                    .source_location = source_location,
+                    .resolution = .fromObjectFunction(index),
+                    .type = ptr.type_index,
+                };
+            }
+        },
+
+        inline .global, .global_import, .table, .table_import => |i| {
+            const ptr = i.ptr(wasm);
+            ptr.name = symbol.name;
+            ptr.flags = symbol.flags;
+            if (symbol.flags.undefined and symbol.flags.binding == .local) {
+                const name = wasm.stringSlice(ptr.name.unwrap().?);
+                diags.addParseError(path, "local symbol '{s}' references import", .{name});
+            }
+        },
+        .section => |i| {
+            // Name is provided by the section directly; symbol table does not have it.
+            const ptr = i.ptr(wasm);
+            ptr.flags = symbol.flags;
+            if (symbol.flags.undefined and symbol.flags.binding == .local) {
+                const name = wasm.stringSlice(ptr.name);
+                diags.addParseError(path, "local symbol '{s}' references import", .{name});
+            }
+        },
+        .data_import => {
+            const name = symbol.name.unwrap().?;
+            log.warn("TODO data import '{s}'", .{name.slice(wasm)});
+        },
+        .data => |data| {
+            const ptr = data.ptr(wasm);
+            ptr.name = symbol.name;
+            ptr.flags = symbol.flags;
+            ptr.offset = data.segment_offset;
+            ptr.size = data.size;
+        },
+    };
+
+    // Apply segment_info.
+    for (wasm.relocatable_datas.items[relocatable_data_start..], ss.segment_info.items) |*data, info| {
+        data.name = info.name.toOptional();
+        data.flags.strings = info.flags.strings;
+        data.flags.tls = data.flags.tls or info.flags.tls;
+        data.flags.no_strip = info.flags.retain;
+        data.flags.alignment = info.flags.alignment;
+        if (data.flags.undefined and data.flags.binding == .local) {
+            const name = wasm.stringSlice(info.name);
+            diags.addParseError(path, "local symbol '{s}' references import", .{name});
+        }
+    }
+
+    // Check for indirect function table in case of an MVP object file.
+    legacy_indirect_function_table: {
+        const table_imports = wasm.object_table_imports.items[table_imports_start..];
+        // If there is a symbol for each import table, this is not a legacy object file.
+        if (table_imports.len == table_count) break :legacy_indirect_function_table;
+        if (table_count != 0) {
+            return diags.failParse(path, "expected a table entry symbol for each of the {d} table(s), but instead got {d} symbols.", .{
+                table_imports.len, table_count,
+            });
+        }
+        // MVP object files cannot have any table definitions, only
+        // imports (for the indirect function table).
+        const tables = wasm.object_tables.items[tables_start..];
+        if (tables.len > 0) {
+            return diags.failParse(path, "table definition without representing table symbols", .{});
+        }
+        if (table_imports.len != 1) {
+            return diags.failParse(path, "found more than one table import, but no representing table symbols", .{});
+        }
+        const table_import_name = table_imports[0].name;
+        if (table_import_name != wasm.preloaded_strings.__indirect_function_table) {
+            return diags.failParse(path, "non-indirect function table import '{s}' is missing a corresponding symbol", .{
+                wasm.stringSlice(table_import_name),
+            });
+        }
+        table_imports[0].flags = .{
+            .undefined = true,
+            .no_strip = true,
+        };
+    }
+
+    for (wasm.object_init_funcs.items[init_funcs_start..]) |init_func| {
+        const func = init_func.function_index.ptr(wasm);
+        const params = func.type_index.ptr(wasm).params.slice(wasm);
+        if (params.len != 0) diags.addError("constructor function '{s}' has non-empty parameter list", .{
+            func.name.slice(wasm).?,
+        });
+    }
+
     return .{
         .version = version,
         .path = path,
@@ -603,7 +843,7 @@ fn parse(
         },
         .functions = .{
             .off = functions_start,
-            .len = @intCast(wasm.object_functions.items.len - functions_start),
+            .len = @intCast(wasm.functions.items.len - functions_start),
         },
         .tables = .{
             .off = tables_start,
@@ -617,10 +857,6 @@ fn parse(
             .off = globals_start,
             .len = @intCast(wasm.object_globals.items.len - globals_start),
         },
-        .named_segments_start = .{
-            .off = named_segments_start,
-            .len = @intCast(wasm.object_named_segments.items.len - named_segments_start),
-        },
         .init_funcs = .{
             .off = init_funcs_start,
             .len = @intCast(wasm.object_init_funcs.items.len - init_funcs_start),
@@ -629,17 +865,9 @@ fn parse(
             .off = comdats_start,
             .len = @intCast(wasm.object_comdats.items.len - comdats_start),
         },
-        .symbols = .{
-            .off = symbols_start,
-            .len = @intCast(wasm.object_symbols.items.len - symbols_start),
-        },
         .relocatable_data = .{
             .off = relocatable_data_start,
             .len = @intCast(wasm.object_relocatable_datas.items.len - relocatable_data_start),
-        },
-        .relocatable_code = .{
-            .off = relocatable_code_start,
-            .len = @intCast(wasm.object_relocatable_codes.items.len - relocatable_code_start),
         },
         .relocatable_custom = .{
             .off = relocatable_custom_start,

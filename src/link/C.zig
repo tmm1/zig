@@ -175,14 +175,6 @@ pub fn deinit(self: *C) void {
     self.lazy_code_buf.deinit(gpa);
 }
 
-pub fn freeDecl(self: *C, decl_index: InternPool.DeclIndex) void {
-    const gpa = self.base.comp.gpa;
-    if (self.decl_table.fetchSwapRemove(decl_index)) |kv| {
-        var decl_block = kv.value;
-        decl_block.deinit(gpa);
-    }
-}
-
 pub fn updateFunc(
     self: *C,
     pt: Zcu.PerThread,
@@ -377,14 +369,6 @@ pub fn updateNav(self: *C, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) !
     };
     gop.value_ptr.code = try self.addString(object.code.items);
     gop.value_ptr.fwd_decl = try self.addString(object.dg.fwd_decl.items);
-}
-
-pub fn updateNavLineNumber(self: *C, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) !void {
-    // The C backend does not have the ability to fix line numbers without re-generating
-    // the entire Decl.
-    _ = self;
-    _ = pt;
-    _ = nav_index;
 }
 
 pub fn flush(self: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Progress.Node) !void {

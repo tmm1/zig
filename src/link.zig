@@ -727,6 +727,10 @@ pub const File = struct {
         }
     }
 
+    /// This currently has no call sites however it is a bug that the frontend
+    /// does not call this function during incremental compilation for
+    /// functions whose values are unchanged but have shifted around in the file.
+    /// Tracking issue: https://github.com/ziglang/zig/issues/21940
     pub fn updateNavLineNumber(
         base: *File,
         pt: Zcu.PerThread,
@@ -883,16 +887,6 @@ pub const File = struct {
             inline else => |tag| {
                 dev.check(tag.devFeature());
                 return @as(*tag.Type(), @fieldParentPtr("base", base)).flushModule(arena, tid, prog_node);
-            },
-        }
-    }
-
-    /// Called when a Decl is deleted from the Zcu.
-    pub fn freeDecl(base: *File, decl_index: InternPool.DeclIndex) void {
-        switch (base.tag) {
-            inline else => |tag| {
-                dev.check(tag.devFeature());
-                @as(*tag.Type(), @fieldParentPtr("base", base)).freeDecl(decl_index);
             },
         }
     }
